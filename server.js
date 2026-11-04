@@ -15,12 +15,26 @@ const PRODUCT_FEE = Number(env.PRODUCT_FEE || 0.25);
 const FREE_SHOPS = Number(env.FREE_SHOPS || 20);
 const FREE_PRODUCTS = Number(env.FREE_PRODUCTS || 3);
 const REFUND_DEDUCT = Number(env.REFUND_DEDUCT ?? 0.01);
-const ADMINS = (env.ADMIN_USERNAMES || "").split(",").map(s => s.trim().toLowerCase()).filter(Boolean);
+const ADMINS = (env.ADMIN_USERNAMES || "").split(",").map(s => s.trim().replace(/^@/, "").toLowerCase()).filter(Boolean);
 const PI_API = "https://api.minepi.com/v2";
 const PI_KEY = env.PI_API_KEY;
 
-admin.initializeApp({ credential: admin.credential.cert(JSON.parse(env.FIREBASE_SERVICE_ACCOUNT)) });
+/* العناوين المسموح لها باستدعاء السيرفر (واجهة GitHub Pages) */
+const ORIGINS = (env.ALLOWED_ORIGIN || "https://veoabdo.github.io")
+  .split(",").map(s => s.trim().replace(/\/$/, "")).filter(Boolean);
+
+/* ===== Firebase ===== */
+let serviceAccount;
+try {
+  serviceAccount = JSON.parse(env.FIREBASE_SERVICE_ACCOUNT);
+  if (serviceAccount.private_key) serviceAccount.private_key = serviceAccount.private_key.replace(/\\n/g, "\n");
+} catch (e) {
+  console.error("FIREBASE_SERVICE_ACCOUNT غير صالح: تأكد أنه JSON كامل");
+  throw e;
+}
+admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
 const db = admin.firestore();
+
 cloudinary.v2.config({
   cloud_name: env.CLOUDINARY_CLOUD_NAME,
   api_key: env.CLOUDINARY_API_KEY,
@@ -45,6 +59,8 @@ function limited(key, max, ms) {
   e.c++; rl.set(key, e);
   return e.c > max;
 }
+setInterval(() => { const n = Date.now(); for (const [k, v] of rl) if (n - v.s > 3600000) rl.delete(k); }, 600000).unref();
+
 const clean = (v, max) => String(v ?? "").replace(/[\u0000-\u001F]/g, " ").trim().slice(0, max);
 const isImg = u => typeof u === "string" && u.startsWith("https://res.cloudinary.com/");
 const wrap = fn => async (req, res) => {
@@ -74,9 +90,25 @@ const pubShop = (id, d) => ({ id, name: d.name, country: d.country, region: d.re
 const pubProd = (id, d) => ({ id, name: d.name, brand: d.brand || "", size: d.size || "", price: d.price, currency: d.currency || "", description: d.description || "", image: d.image || "" });
 
 const app = express();
+
+/* ===== CORS: يسمح لواجهة GitHub Pages بالاتصال بهذا السيرفر ===== */
+app.use((req, res, next) => {
+  const o = req.headers.origin;
+  if (o && ORIGINS.includes(o)) {
+    res.setHeader("Access-Control-Allow-Origin", o);
+    res.setHeader("Vary", "Origin");
+    res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+    res.setHeader("Access-Control-Max-Age", "86400");
+  }
+  if (req.method === "OPTIONS") return res.sendStatus(204);
+  next();
+});
+
 app.use(express.json({ limit: "6mb" }));
 
 /* ===== عام ===== */
+app.get("/", (_, res) => res.send("Parfum API is running"));
 app.get("/health", (_, res) => res.json({ ok: true, app: "Parfum" }));
 
 app.get("/api/config", wrap(async (_, res) => {
@@ -133,11 +165,13 @@ app.post("/api/shop/save", wrap(async (req, res) => {
     description: clean(b.description, 500), image: isImg(b.image) ? b.image : ""
   };
   if (!data.name || !/^[A-Z]{2}$/.test(data.country) || !data.region || !data.address || !data.phone || !data.image)
-    return res.status(400).json({ error: "Please complete all required fields" });
+    return res.status(400).json({ error: "Please complete all required fields (including the shop photo)" });
   const ref = db.collection("shops").doc(u.uid);
   const snap = await ref.get();
   if (snap.exists) {
-    await ref.update({ ...data, status: "pending", reviewMessage: "", updatedAt: Date.now() });
+    const old = snap.data();
+    // إذا كان المحل مدفوعاً أو مجانياً سابقاً نبقي حالة الدفع، لكن نعيده للمراجعة
+    await ref.update({ ...data, status: "pending", reviewMessage: "", updatedAt: Date.now(), feePaid: !!old.feePaid });
   } else {
     await ref.set({
       ...data, ownerUid: u.uid, ownerUsername: u.username, status: "pending",
@@ -160,12 +194,12 @@ app.post("/api/product/save", wrap(async (req, res) => {
     image: isImg(b.image) ? b.image : ""
   };
   if (!data.name || !(price > 0 && price < 1e9) || !data.currency || !data.image)
-    return res.status(400).json({ error: "Please complete all required fields" });
+    return res.status(400).json({ error: "Please complete all required fields (including the product photo)" });
   if (b.id) {
     const ref = db.collection("products").doc(String(b.id));
     const s = await ref.get();
     if (!s.exists || s.data().ownerUid !== u.uid) return res.status(403).json({ error: "Not your product" });
-    await ref.update({ ...data, status: "pending", reviewMessage: "", updatedAt: Date.now() });
+    await ref.update({ ...data, status: "pending", reviewMessage: "", updatedAt: Date.now(), feePaid: !!s.data().feePaid });
   } else {
     const count = (await db.collection("products").where("ownerUid", "==", u.uid).get()).size;
     if (count >= 200) return res.status(400).json({ error: "Product limit reached" });
@@ -274,6 +308,7 @@ app.post("/api/admin/review", wrap(async (req, res) => {
   }
   const stats = db.doc("stats/platform");
   const status = await db.runTransaction(async t => {
+    // في Firestore يجب إجراء كل القراءات قبل أي كتابة
     const s = await t.get(ref);
     if (!s.exists) throw new Error("Not found");
     const d = s.data();
@@ -355,7 +390,7 @@ app.post("/api/admin/refund", wrap(async (req, res) => {
   res.json({ success: true, txid, amount: refundAmt });
 }));
 
-/* ===== الواجهة ===== */
+/* ===== الواجهة (اختياري: إذا وُجد مجلد public) ===== */
 app.use(express.static(path.join(__dirname, "public")));
 
 const PORT = env.PORT || 3000;
