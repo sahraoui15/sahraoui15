@@ -10,10 +10,8 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const env = process.env;
 
 /* ===== الإعدادات (يمكن تغييرها من Render بدون تعديل الكود) ===== */
-const SHOP_FEE = Number(env.SHOP_FEE || 5);
-const PRODUCT_FEE = Number(env.PRODUCT_FEE || 0.25);
-const FREE_SHOPS = Number(env.FREE_SHOPS || 20);
-const FREE_PRODUCTS = Number(env.FREE_PRODUCTS || 3);
+const SHOP_FEE = Number(env.SHOP_FEE || 5);          // رسوم فتح المحل
+const PRODUCT_FEE = Number(env.PRODUCT_FEE || 0.25); // رسوم إضافة منتج
 const REFUND_DEDUCT = Number(env.REFUND_DEDUCT ?? 0.01);
 const ADMINS = (env.ADMIN_USERNAMES || "").split(",").map(s => s.trim().replace(/^@/, "").toLowerCase()).filter(Boolean);
 const PI_API = "https://api.minepi.com/v2";
@@ -71,7 +69,7 @@ const wrap = fn => async (req, res) => {
 async function auth(req, res) {
   const { accessToken, userUid } = req.body || {};
   if (!accessToken || !userUid) { res.status(400).json({ error: "Missing data" }); return null; }
-  if (limited("a_" + userUid, 60, 60000)) { res.status(429).json({ error: "Too many requests" }); return null; }
+  if (limited("a_" + userUid, 90, 60000)) { res.status(429).json({ error: "Too many requests" }); return null; }
   const r = await fetch(PI_API + "/me", { headers: { Authorization: "Bearer " + accessToken } });
   if (!r.ok) { res.status(401).json({ error: "Invalid token" }); return null; }
   const u = await r.json();
@@ -86,8 +84,8 @@ async function adminOnly(req, res) {
   return u;
 }
 
-const pubShop = (id, d) => ({ id, name: d.name, country: d.country, region: d.region, address: d.address, phone: d.phone, hours: d.hours || "", description: d.description || "", image: d.image || "", founder: !!d.free });
-const pubProd = (id, d) => ({ id, name: d.name, brand: d.brand || "", size: d.size || "", price: d.price, currency: d.currency || "", description: d.description || "", image: d.image || "" });
+const pubShop = (id, d) => ({ id, name: d.name, country: d.country, region: d.region, address: d.address, phone: d.phone, hours: d.hours || "", description: d.description || "", image: d.image || "" });
+const pubProd = (id, d) => ({ id, name: d.name, brand: d.brand || "", size: d.size || "", price: d.price, currency: d.currency || "", description: d.description || "", image: d.image || "", createdAt: d.createdAt || 0 });
 
 const app = express();
 
@@ -111,16 +109,15 @@ app.use(express.json({ limit: "6mb" }));
 app.get("/", (_, res) => res.send("Parfum API is running"));
 app.get("/health", (_, res) => res.json({ ok: true, app: "Parfum" }));
 
-app.get("/api/config", wrap(async (_, res) => {
-  const st = (await db.doc("stats/platform").get()).data() || {};
+app.get("/api/config", (_, res) => {
   res.json({
-    shopFee: SHOP_FEE, productFee: PRODUCT_FEE, freeProducts: FREE_PRODUCTS,
+    shopFee: SHOP_FEE, productFee: PRODUCT_FEE,
     refundDeduct: REFUND_DEDUCT,
-    freeLeft: Math.max(0, FREE_SHOPS - (st.freeShopsUsed || 0)),
     sandbox: env.PI_SANDBOX === "true"
   });
-}));
+});
 
+/* المحلات المنشورة مع منتجاتها المنشورة */
 app.get("/api/shops", wrap(async (_, res) => {
   const [s, p] = await Promise.all([
     db.collection("shops").where("status", "==", "live").get(),
@@ -128,26 +125,31 @@ app.get("/api/shops", wrap(async (_, res) => {
   ]);
   const prods = {};
   p.forEach(d => { const x = d.data(); (prods[x.shopId] = prods[x.shopId] || []).push(pubProd(d.id, x)); });
-  res.json({ shops: s.docs.map(d => ({ ...pubShop(d.id, d.data()), products: prods[d.id] || [] })) });
+  const shops = s.docs.map(d => {
+    const list = (prods[d.id] || []).sort((a, b) => b.createdAt - a.createdAt);
+    return { ...pubShop(d.id, d.data()), products: list };
+  });
+  res.json({ shops });
 }));
 
-/* ===== حساب التاجر ===== */
+/* ===== حساب المستخدم ===== */
 app.post("/api/me", wrap(async (req, res) => {
   const u = await auth(req, res); if (!u) return;
   const [sd, ps] = await Promise.all([
     db.collection("shops").doc(u.uid).get(),
     db.collection("products").where("ownerUid", "==", u.uid).get()
   ]);
+  const products = ps.docs.map(d => ({ id: d.id, ...d.data() })).sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
   res.json({
     user: { uid: u.uid, username: u.username }, isAdmin: u.isAdmin,
     shop: sd.exists ? { id: sd.id, ...sd.data() } : null,
-    products: ps.docs.map(d => ({ id: d.id, ...d.data() }))
+    products
   });
 }));
 
 app.post("/api/upload", wrap(async (req, res) => {
   const u = await auth(req, res); if (!u) return;
-  if (limited("up_" + u.uid, 20, 3600000)) return res.status(429).json({ error: "Too many uploads" });
+  if (limited("up_" + u.uid, 30, 3600000)) return res.status(429).json({ error: "Too many uploads" });
   const f = req.body.file || "";
   const m = f.match(/^data:image\/(jpeg|png|webp);base64,(.+)$/);
   if (!m) return res.status(400).json({ error: "Invalid image" });
@@ -156,6 +158,7 @@ app.post("/api/upload", wrap(async (req, res) => {
   res.json({ url: r.secure_url });
 }));
 
+/* ===== المحل: حفظ البيانات (الحالة الأولى unpaid حتى يتم دفع 5 Pi) ===== */
 app.post("/api/shop/save", wrap(async (req, res) => {
   const u = await auth(req, res); if (!u) return;
   const b = req.body;
@@ -170,22 +173,25 @@ app.post("/api/shop/save", wrap(async (req, res) => {
   const snap = await ref.get();
   if (snap.exists) {
     const old = snap.data();
-    // إذا كان المحل مدفوعاً أو مجانياً سابقاً نبقي حالة الدفع، لكن نعيده للمراجعة
-    await ref.update({ ...data, status: "pending", reviewMessage: "", updatedAt: Date.now(), feePaid: !!old.feePaid });
+    if (old.status === "removed") return res.status(403).json({ error: "This shop was removed by the administrator" });
+    const upd = { ...data, ownerUsername: u.username, updatedAt: Date.now() };
+    if (old.status === "refunded") { upd.status = "unpaid"; upd.reviewMessage = ""; }
+    await ref.update(upd);
   } else {
     await ref.set({
-      ...data, ownerUid: u.uid, ownerUsername: u.username, status: "pending",
-      feePaid: false, free: false, freeProductsUsed: 0, reviewMessage: "", createdAt: Date.now()
+      ...data, ownerUid: u.uid, ownerUsername: u.username, status: "unpaid",
+      feePaid: false, reviewMessage: "", createdAt: Date.now()
     });
   }
-  res.json({ success: true });
+  res.json({ success: true, id: u.uid });
 }));
 
+/* ===== المنتجات: حفظ (جديد = unpaid حتى يتم دفع 0.25 Pi) ===== */
 app.post("/api/product/save", wrap(async (req, res) => {
   const u = await auth(req, res); if (!u) return;
   const shop = await db.collection("shops").doc(u.uid).get();
   if (!shop.exists || shop.data().status !== "live")
-    return res.status(400).json({ error: "Your shop must be live first" });
+    return res.status(400).json({ error: "Your shop must be open first" });
   const b = req.body;
   const price = Number(b.price);
   const data = {
@@ -199,16 +205,20 @@ app.post("/api/product/save", wrap(async (req, res) => {
     const ref = db.collection("products").doc(String(b.id));
     const s = await ref.get();
     if (!s.exists || s.data().ownerUid !== u.uid) return res.status(403).json({ error: "Not your product" });
-    await ref.update({ ...data, status: "pending", reviewMessage: "", updatedAt: Date.now(), feePaid: !!s.data().feePaid });
-  } else {
-    const count = (await db.collection("products").where("ownerUid", "==", u.uid).get()).size;
-    if (count >= 200) return res.status(400).json({ error: "Product limit reached" });
-    await db.collection("products").add({
-      ...data, shopId: u.uid, ownerUid: u.uid, status: "pending", feePaid: false, free: false,
-      reviewMessage: "", createdAt: Date.now()
-    });
+    const old = s.data();
+    if (old.status === "removed") return res.status(403).json({ error: "This product was removed by the administrator" });
+    const upd = { ...data, updatedAt: Date.now() };
+    if (old.status === "refunded") { upd.status = "unpaid"; upd.reviewMessage = ""; }
+    await ref.update(upd);
+    return res.json({ success: true, id: ref.id });
   }
-  res.json({ success: true });
+  const count = (await db.collection("products").where("ownerUid", "==", u.uid).get()).size;
+  if (count >= 200) return res.status(400).json({ error: "Product limit reached" });
+  const added = await db.collection("products").add({
+    ...data, shopId: u.uid, ownerUid: u.uid, status: "unpaid", feePaid: false,
+    reviewMessage: "", createdAt: Date.now()
+  });
+  res.json({ success: true, id: added.id });
 }));
 
 app.post("/api/product/delete", wrap(async (req, res) => {
@@ -245,7 +255,7 @@ app.post("/api/pay/approve", wrap(async (req, res) => {
   if (!paymentId) return res.status(400).json({ error: "Missing data" });
   const p = await getPayment(paymentId);
   const c = await checkPayment(p);
-  if (c.d.status !== "approved_unpaid") throw new Error("Not awaiting payment");
+  if (c.d.status !== "unpaid") throw new Error("Not awaiting payment");
   const r = await fetch(`${PI_API}/payments/${paymentId}/approve`, { method: "POST", headers: { Authorization: `Key ${PI_KEY}` } });
   if (!r.ok) throw new Error(await r.text());
   res.json({ success: true });
@@ -254,94 +264,70 @@ app.post("/api/pay/approve", wrap(async (req, res) => {
 app.post("/api/pay/complete", wrap(async (req, res) => {
   const { paymentId, txid } = req.body || {};
   if (!paymentId) return res.status(400).json({ error: "Missing data" });
-  const done = await db.collection("payments").doc(paymentId).get();
+  const pid = String(paymentId);
+  const done = await db.collection("payments").doc(pid).get();
   if (done.exists) return res.json({ success: true });
-  const p = await getPayment(paymentId);
+  const p = await getPayment(pid);
   const c = await checkPayment(p);
-  if (c.d.status !== "approved_unpaid") throw new Error("Not awaiting payment");
   const tx = (p.transaction && p.transaction.txid) || txid;
   if (!tx) throw new Error("Missing txid");
   if (!(p.status && p.status.developer_completed)) {
-    const r = await fetch(`${PI_API}/payments/${paymentId}/complete`, {
+    const r = await fetch(`${PI_API}/payments/${pid}/complete`, {
       method: "POST", headers: { Authorization: `Key ${PI_KEY}`, "Content-Type": "application/json" },
       body: JSON.stringify({ txid: tx })
     });
     if (!r.ok) throw new Error(await r.text());
   }
+  // إذا كان العنصر منشوراً مسبقاً (دفعة مكررة) نسجّلها فقط ليتمكن الأدمن من استرجاعها
+  const fresh = c.d.status === "unpaid";
   const b = db.batch();
-  b.update(c.ref, { status: "live", feePaid: true });
-  b.set(db.collection("payments").doc(paymentId), {
+  if (fresh) b.update(c.ref, { status: "live", feePaid: true, publishedAt: Date.now() });
+  b.set(db.collection("payments").doc(pid), {
     userUid: p.user_uid, type: c.type, targetId: c.targetId, targetName: c.d.name,
-    amount: c.fee, txid: tx, paidAt: Date.now(), refundStatus: "none"
+    amount: c.fee, txid: tx, paidAt: Date.now(), refundStatus: "none", duplicate: !fresh
   });
   await b.commit();
   res.json({ success: true });
 }));
 
-/* ===== الإدارة: المراجعة والاسترجاع ===== */
-app.post("/api/admin/pending", wrap(async (req, res) => {
+/* ===== الإدارة ===== */
+app.post("/api/admin/list", wrap(async (req, res) => {
   const u = await adminOnly(req, res); if (!u) return;
-  const [s, p] = await Promise.all([
-    db.collection("shops").where("status", "==", "pending").get(),
-    db.collection("products").where("status", "==", "pending").get()
+  const [s, p, y] = await Promise.all([
+    db.collection("shops").limit(300).get(),
+    db.collection("products").limit(500).get(),
+    db.collection("payments").orderBy("paidAt", "desc").limit(50).get()
   ]);
-  const ids = [...new Set(p.docs.map(d => d.data().shopId))];
   const names = {};
-  await Promise.all(ids.map(async id => { const x = await db.collection("shops").doc(id).get(); names[id] = x.exists ? x.data().name : ""; }));
-  res.json({
-    shops: s.docs.map(d => ({ id: d.id, ...d.data() })),
-    products: p.docs.map(d => ({ id: d.id, ...d.data(), shopName: names[d.data().shopId] }))
-  });
+  const shops = s.docs.map(d => {
+    const x = d.data(); names[d.id] = x.name;
+    return { id: d.id, name: x.name, country: x.country, region: x.region, ownerUsername: x.ownerUsername, status: x.status, image: x.image || "", createdAt: x.createdAt || 0 };
+  }).sort((a, b) => b.createdAt - a.createdAt);
+  const products = p.docs.map(d => {
+    const x = d.data();
+    return { id: d.id, name: x.name, shopId: x.shopId, shopName: names[x.shopId] || "", price: x.price, currency: x.currency, status: x.status, image: x.image || "", createdAt: x.createdAt || 0 };
+  }).sort((a, b) => b.createdAt - a.createdAt);
+  res.json({ shops, products, payments: y.docs.map(d => ({ id: d.id, ...d.data() })) });
 }));
 
-app.post("/api/admin/review", wrap(async (req, res) => {
+app.post("/api/admin/moderate", wrap(async (req, res) => {
   const u = await adminOnly(req, res); if (!u) return;
   const { type, id, action, message } = req.body;
-  if (!["shop", "product"].includes(type) || !["approve", "reject"].includes(action) || !id)
+  if (!["shop", "product"].includes(type) || !["remove", "restore"].includes(action) || !id)
     return res.status(400).json({ error: "Bad request" });
   const ref = db.collection(type === "shop" ? "shops" : "products").doc(String(id));
-  if (action === "reject") {
+  const s = await ref.get();
+  if (!s.exists) return res.status(404).json({ error: "Not found" });
+  if (action === "remove") {
     const msg = clean(message, 300);
     if (!msg) return res.status(400).json({ error: "Reason required" });
-    await ref.update({ status: "rejected", reviewMessage: msg, reviewedAt: Date.now() });
-    return res.json({ success: true, status: "rejected" });
-  }
-  const stats = db.doc("stats/platform");
-  const status = await db.runTransaction(async t => {
-    // في Firestore يجب إجراء كل القراءات قبل أي كتابة
-    const s = await t.get(ref);
-    if (!s.exists) throw new Error("Not found");
+    await ref.update({ status: "removed", reviewMessage: msg, reviewedAt: Date.now() });
+  } else {
     const d = s.data();
-    if (d.status !== "pending") throw new Error("Not pending");
-    const upd = { reviewMessage: "", reviewedAt: Date.now() };
-    if (d.feePaid) {
-      upd.status = "live";
-    } else if (type === "shop") {
-      const st = await t.get(stats);
-      const used = (st.data() || {}).freeShopsUsed || 0;
-      if (used < FREE_SHOPS) {
-        upd.status = "live"; upd.feePaid = true; upd.free = true;
-        t.set(stats, { freeShopsUsed: used + 1 }, { merge: true });
-      } else upd.status = "approved_unpaid";
-    } else {
-      const sref = db.collection("shops").doc(d.shopId);
-      const sd = await t.get(sref);
-      const used = (sd.data() || {}).freeProductsUsed || 0;
-      if (used < FREE_PRODUCTS) {
-        upd.status = "live"; upd.feePaid = true; upd.free = true;
-        t.update(sref, { freeProductsUsed: used + 1 });
-      } else upd.status = "approved_unpaid";
-    }
-    t.update(ref, upd);
-    return upd.status;
-  });
-  res.json({ success: true, status });
-}));
-
-app.post("/api/admin/payments", wrap(async (req, res) => {
-  const u = await adminOnly(req, res); if (!u) return;
-  const s = await db.collection("payments").orderBy("paidAt", "desc").limit(50).get();
-  res.json({ payments: s.docs.map(d => ({ id: d.id, ...d.data() })) });
+    if (d.status !== "removed") return res.status(400).json({ error: "Not removed" });
+    await ref.update({ status: d.feePaid ? "live" : "unpaid", reviewMessage: "", reviewedAt: Date.now() });
+  }
+  res.json({ success: true });
 }));
 
 app.post("/api/admin/refund", wrap(async (req, res) => {
@@ -384,8 +370,12 @@ app.post("/api/admin/refund", wrap(async (req, res) => {
       refundAmount: refundAmt, refundDeduction: REFUND_DEDUCT,
       refundReason: clean(reason, 200), refundedBy: u.username
     });
-    const col = info.type === "shop_fee" ? "shops" : "products";
-    await db.collection(col).doc(info.targetId).update({ status: "refunded", feePaid: false, reviewMessage: clean(reason, 200) });
+    if (!info.duplicate) {
+      const col = info.type === "shop_fee" ? "shops" : "products";
+      const tref = db.collection(col).doc(info.targetId);
+      if ((await tref.get()).exists)
+        await tref.update({ status: "refunded", feePaid: false, reviewMessage: clean(reason, 200) });
+    }
   } catch (e) { console.error("Refund sent but DB update failed:", paymentId, txid, e.message); }
   res.json({ success: true, txid, amount: refundAmt });
 }));
