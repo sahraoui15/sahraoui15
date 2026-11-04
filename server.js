@@ -307,33 +307,17 @@ app.post("/api/admin/list", wrap(async (req, res) => {
     const x = d.data();
     return { id: d.id, name: x.name, shopId: x.shopId, shopName: names[x.shopId] || "", price: x.price, currency: x.currency, status: x.status, image: x.image || "", createdAt: x.createdAt || 0 };
   }).sort((a, b) => b.createdAt - a.createdAt);
-  res.json({ shops, products, payments: y.docs.map(d => ({ id: d.id, ...d.data() })) });
+  const st = {};
+  shops.forEach(x => { st["shop_fee:" + x.id] = x.status; });
+  products.forEach(x => { st["product_fee:" + x.id] = x.status; });
+  res.json({
+    shops, products,
+    payments: y.docs.map(d => { const x = d.data(); return { id: d.id, ...x, targetStatus: st[x.type + ":" + x.targetId] || "missing" }; })
+  });
 }));
 
-app.post("/api/admin/moderate", wrap(async (req, res) => {
-  const u = await adminOnly(req, res); if (!u) return;
-  const { type, id, action, message } = req.body;
-  if (!["shop", "product"].includes(type) || !["remove", "restore"].includes(action) || !id)
-    return res.status(400).json({ error: "Bad request" });
-  const ref = db.collection(type === "shop" ? "shops" : "products").doc(String(id));
-  const s = await ref.get();
-  if (!s.exists) return res.status(404).json({ error: "Not found" });
-  if (action === "remove") {
-    const msg = clean(message, 300);
-    if (!msg) return res.status(400).json({ error: "Reason required" });
-    await ref.update({ status: "removed", reviewMessage: msg, reviewedAt: Date.now() });
-  } else {
-    const d = s.data();
-    if (d.status !== "removed") return res.status(400).json({ error: "Not removed" });
-    await ref.update({ status: d.feePaid ? "live" : "unpaid", reviewMessage: "", reviewedAt: Date.now() });
-  }
-  res.json({ success: true });
-}));
-
-app.post("/api/admin/refund", wrap(async (req, res) => {
-  const u = await adminOnly(req, res); if (!u) return;
-  const { paymentId, reason } = req.body;
-  if (!paymentId) return res.status(400).json({ error: "Missing data" });
+/* استرجاع دفعة واحدة. لا يُستدعى إلا بعد حذف المحل/المنتج من قبل المطور */
+async function refundPayment(paymentId, reason, by) {
   const pref = db.collection("payments").doc(String(paymentId));
   // قفل لمنع الاسترجاع المزدوج
   const info = await db.runTransaction(async t => {
@@ -348,7 +332,7 @@ app.post("/api/admin/refund", wrap(async (req, res) => {
   const refundAmt = Number((Number(info.amount) - REFUND_DEDUCT).toFixed(7));
   if (!(refundAmt > 0)) {
     await pref.update({ refundStatus: "failed" }).catch(() => {});
-    return res.status(400).json({ error: "Refund amount too small" });
+    throw new Error("Refund amount too small");
   }
   let rid = null, txid = null;
   try {
@@ -363,21 +347,66 @@ app.post("/api/admin/refund", wrap(async (req, res) => {
     if (rid) { try { await pi().cancelPayment(rid); } catch {} }
     throw e;
   }
-  // الأموال أُرسلت: نسجّل النتيجة ونخفي العنصر
   try {
     await pref.update({
       refundStatus: "refunded", refundTxid: txid, refundedAt: Date.now(),
       refundAmount: refundAmt, refundDeduction: REFUND_DEDUCT,
-      refundReason: clean(reason, 200), refundedBy: u.username
+      refundReason: clean(reason, 200), refundedBy: by
     });
-    if (!info.duplicate) {
-      const col = info.type === "shop_fee" ? "shops" : "products";
-      const tref = db.collection(col).doc(info.targetId);
-      if ((await tref.get()).exists)
-        await tref.update({ status: "refunded", feePaid: false, reviewMessage: clean(reason, 200) });
-    }
   } catch (e) { console.error("Refund sent but DB update failed:", paymentId, txid, e.message); }
-  res.json({ success: true, txid, amount: refundAmt });
+  return { txid, amount: refundAmt };
+}
+
+/* حذف محل/منتج (يسترجع رسومه تلقائياً) أو استعادته */
+app.post("/api/admin/moderate", wrap(async (req, res) => {
+  const u = await adminOnly(req, res); if (!u) return;
+  const { type, id, action, message } = req.body;
+  if (!["shop", "product"].includes(type) || !["remove", "restore"].includes(action) || !id)
+    return res.status(400).json({ error: "Bad request" });
+  const ref = db.collection(type === "shop" ? "shops" : "products").doc(String(id));
+  const s = await ref.get();
+  if (!s.exists) return res.status(404).json({ error: "Not found" });
+
+  if (action === "restore") {
+    const d = s.data();
+    if (d.status !== "removed") return res.status(400).json({ error: "Not removed" });
+    await ref.update({ status: d.feePaid ? "live" : "unpaid", reviewMessage: "", reviewedAt: Date.now() });
+    return res.json({ success: true });
+  }
+
+  const msg = clean(message, 300);
+  if (!msg) return res.status(400).json({ error: "Reason required" });
+  await ref.update({ status: "removed", reviewMessage: msg, reviewedAt: Date.now() });
+
+  // استرجاع رسوم هذا العنصر فقط (المحل: رسوم المحل، المنتج: رسوم المنتج)
+  const feeType = type === "shop" ? "shop_fee" : "product_fee";
+  const ps = await db.collection("payments").where("targetId", "==", String(id)).get();
+  let refunded = 0, failed = 0, total = 0;
+  for (const d of ps.docs) {
+    const x = d.data();
+    if (x.type !== feeType || !["none", "failed"].includes(x.refundStatus)) continue;
+    try { const r = await refundPayment(d.id, msg, u.username); refunded++; total += r.amount; }
+    catch (e) { failed++; console.error("Refund failed:", d.id, e.message); }
+  }
+  if (refunded) await ref.update({ feePaid: false });
+  res.json({ success: true, refunded, failed, amount: Number(total.toFixed(7)) });
+}));
+
+/* إعادة محاولة استرجاع فاشل: مسموح فقط إذا كان المحل/المنتج محذوفاً */
+app.post("/api/admin/refund", wrap(async (req, res) => {
+  const u = await adminOnly(req, res); if (!u) return;
+  const { paymentId, reason } = req.body;
+  if (!paymentId) return res.status(400).json({ error: "Missing data" });
+  const ps = await db.collection("payments").doc(String(paymentId)).get();
+  if (!ps.exists) return res.status(404).json({ error: "Payment not found" });
+  const x = ps.data();
+  const col = x.type === "shop_fee" ? "shops" : "products";
+  const tg = await db.collection(col).doc(String(x.targetId)).get();
+  if (!tg.exists || tg.data().status !== "removed")
+    return res.status(400).json({ error: "Remove the shop/product first. Refunds happen only after removal." });
+  const r = await refundPayment(paymentId, reason || tg.data().reviewMessage, u.username);
+  await tg.ref.update({ feePaid: false });
+  res.json({ success: true, txid: r.txid, amount: r.amount });
 }));
 
 /* ===== الواجهة (اختياري: إذا وُجد مجلد public) ===== */
