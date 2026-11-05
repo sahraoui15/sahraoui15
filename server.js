@@ -42,13 +42,31 @@ cloudinary.v2.config({
 let _pi = null;
 function pi() {
   if (!_pi) {
-    const PiNetwork = require("pi-backend").default;
+    const m = require("pi-backend");
+    const PiNetwork = m.default || m;
     _pi = new PiNetwork(PI_KEY, env.PI_WALLET_SECRET);
   }
   return _pi;
 }
 
 /* ===== أدوات مساعدة ===== */
+
+/* استخراج رسالة خطأ آمنة (بدون طباعة كائن axios الذي يحتوي مفاتيح سرية) */
+function errInfo(e) {
+  const d = e && e.response && e.response.data;
+  if (d) return typeof d === "string" ? d : JSON.stringify(d);
+  return (e && e.message) || String(e);
+}
+function friendlyRefundError(msg) {
+  if (msg.includes("missing_scope") || msg.includes("wallet_address"))
+    return "المستخدم لم يمنح صلاحية wallet_address. يجب أن يفتح التطبيق ويسجّل الدخول من جديد ويوافق على الصلاحية، ثم أعد الاسترجاع.";
+  if (msg.includes("insufficient") || msg.includes("balance"))
+    return "رصيد محفظة التطبيق غير كافٍ (تذكّر احتياطي الحساب ~1 Pi). اشحن المحفظة ثم أعد المحاولة.";
+  if (msg.includes("ongoing_payment"))
+    return "توجد دفعة معلّقة لهذا المستخدم. أعد المحاولة بعد قليل.";
+  return "فشل الاسترجاع: " + msg.slice(0, 300);
+}
+
 const rl = new Map();
 function limited(key, max, ms) {
   const now = Date.now();
@@ -63,7 +81,10 @@ const clean = (v, max) => String(v ?? "").replace(/[\u0000-\u001F]/g, " ").trim(
 const isImg = u => typeof u === "string" && u.startsWith("https://res.cloudinary.com/");
 const wrap = fn => async (req, res) => {
   try { await fn(req, res); }
-  catch (e) { console.error(e); if (!res.headersSent) res.status(500).json({ error: e.message }); }
+  catch (e) {
+    console.error("ERROR", req.method, req.path, errInfo(e)); // لا نطبع e كاملاً أبداً
+    if (!res.headersSent) res.status(500).json({ error: errInfo(e).slice(0, 400) });
+  }
 };
 
 async function auth(req, res) {
@@ -88,6 +109,14 @@ const pubShop = (id, d) => ({ id, name: d.name, country: d.country, region: d.re
 const pubProd = (id, d) => ({ id, name: d.name, brand: d.brand || "", size: d.size || "", price: d.price, currency: d.currency || "", description: d.description || "", image: d.image || "", createdAt: d.createdAt || 0 });
 
 const app = express();
+app.disable("x-powered-by");
+
+/* ===== رؤوس أمان أساسية ===== */
+app.use((req, res, next) => {
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("Referrer-Policy", "no-referrer");
+  next();
+});
 
 /* ===== CORS: يسمح لواجهة GitHub Pages بالاتصال بهذا السيرفر ===== */
 app.use((req, res, next) => {
@@ -142,6 +171,7 @@ app.post("/api/me", wrap(async (req, res) => {
   const products = ps.docs.map(d => ({ id: d.id, ...d.data() })).sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
   res.json({
     user: { uid: u.uid, username: u.username }, isAdmin: u.isAdmin,
+    hasWallet: !!u.wallet_address,
     shop: sd.exists ? { id: sd.id, ...sd.data() } : null,
     products
   });
@@ -232,7 +262,7 @@ app.post("/api/product/delete", wrap(async (req, res) => {
 
 /* ===== الدفع (المستخدم إلى التطبيق) ===== */
 async function getPayment(id) {
-  const r = await fetch(`${PI_API}/payments/${id}`, { headers: { Authorization: `Key ${PI_KEY}` } });
+  const r = await fetch(`${PI_API}/payments/${encodeURIComponent(id)}`, { headers: { Authorization: `Key ${PI_KEY}` } });
   if (!r.ok) throw new Error("Payment not found");
   return r.json();
 }
@@ -253,10 +283,11 @@ async function checkPayment(p) {
 app.post("/api/pay/approve", wrap(async (req, res) => {
   const { paymentId } = req.body || {};
   if (!paymentId) return res.status(400).json({ error: "Missing data" });
-  const p = await getPayment(paymentId);
+  const pid = String(paymentId);
+  const p = await getPayment(pid);
   const c = await checkPayment(p);
   if (c.d.status !== "unpaid") throw new Error("Not awaiting payment");
-  const r = await fetch(`${PI_API}/payments/${paymentId}/approve`, { method: "POST", headers: { Authorization: `Key ${PI_KEY}` } });
+  const r = await fetch(`${PI_API}/payments/${encodeURIComponent(pid)}/approve`, { method: "POST", headers: { Authorization: `Key ${PI_KEY}` } });
   if (!r.ok) throw new Error(await r.text());
   res.json({ success: true });
 }));
@@ -272,7 +303,7 @@ app.post("/api/pay/complete", wrap(async (req, res) => {
   const tx = (p.transaction && p.transaction.txid) || txid;
   if (!tx) throw new Error("Missing txid");
   if (!(p.status && p.status.developer_completed)) {
-    const r = await fetch(`${PI_API}/payments/${pid}/complete`, {
+    const r = await fetch(`${PI_API}/payments/${encodeURIComponent(pid)}/complete`, {
       method: "POST", headers: { Authorization: `Key ${PI_KEY}`, "Content-Type": "application/json" },
       body: JSON.stringify({ txid: tx })
     });
@@ -316,6 +347,29 @@ app.post("/api/admin/list", wrap(async (req, res) => {
   });
 }));
 
+/* ===== الاسترجاع (التطبيق إلى المستخدم - A2U) ===== */
+
+/* ينظّف دفعات A2U العالقة. إن وجد دفعة استرجاع لنفس الدفعة لها txid يُكملها ويعيدها (لمنع الاسترجاع المزدوج) */
+async function clearStuck(paymentId) {
+  let resumed = null;
+  let list = [];
+  try { list = (await pi().getIncompleteServerPayments()) || []; }
+  catch (e) { console.error("getIncomplete:", errInfo(e)); return null; }
+  for (const p of list) {
+    const tx = p.transaction && p.transaction.txid;
+    const mine = p.metadata && String(p.metadata.paymentId) === String(paymentId);
+    try {
+      if (tx) {
+        await pi().completePayment(p.identifier, tx);
+        if (mine) resumed = { rid: p.identifier, txid: tx };
+      } else {
+        await pi().cancelPayment(p.identifier);
+      }
+    } catch (e) { console.error("clearStuck:", p.identifier, errInfo(e)); }
+  }
+  return resumed;
+}
+
 /* استرجاع دفعة واحدة. لا يُستدعى إلا بعد حذف المحل/المنتج من قبل المطور */
 async function refundPayment(paymentId, reason, by) {
   const pref = db.collection("payments").doc(String(paymentId));
@@ -324,7 +378,7 @@ async function refundPayment(paymentId, reason, by) {
     const s = await t.get(pref);
     if (!s.exists) throw new Error("Payment not found");
     const d = s.data();
-    if (d.refundStatus !== "none" && d.refundStatus !== "failed") throw new Error("Already refunded or processing");
+    if (!["none", "failed", "stuck"].includes(d.refundStatus)) throw new Error("Already refunded or processing");
     t.update(pref, { refundStatus: "processing" });
     return d;
   });
@@ -334,18 +388,35 @@ async function refundPayment(paymentId, reason, by) {
     await pref.update({ refundStatus: "failed" }).catch(() => {});
     throw new Error("Refund amount too small");
   }
-  let rid = null, txid = null;
+  let rid = info.refundRid || null, txid = info.refundTxid || null;
   try {
-    rid = await pi().createPayment({
-      amount: refundAmt, memo: "Parfum refund",
-      metadata: { type: "refund", paymentId: String(paymentId) }, uid: info.userUid
-    });
-    txid = await pi().submitPayment(rid);
+    if (!rid) {
+      const resumed = await clearStuck(paymentId);
+      if (resumed) { rid = resumed.rid; txid = resumed.txid; }
+    }
+    if (!rid) {
+      rid = await pi().createPayment({
+        amount: refundAmt, memo: "Parfum refund",
+        metadata: { type: "refund", paymentId: String(paymentId) }, uid: info.userUid
+      });
+      await pref.update({ refundRid: rid });
+    }
+    if (!txid) {
+      txid = await pi().submitPayment(rid);
+      await pref.update({ refundTxid: txid });
+    }
     await pi().completePayment(rid, txid);
   } catch (e) {
-    await pref.update({ refundStatus: "failed" }).catch(() => {});
-    if (rid) { try { await pi().cancelPayment(rid); } catch {} }
-    throw e;
+    const raw = errInfo(e);
+    console.error("REFUND ERROR:", paymentId, raw);
+    if (txid) {
+      // المال أُرسل لكن لم يكتمل التسجيل: لا ننشئ دفعة جديدة، نُكمل نفس الدفعة لاحقاً
+      await pref.update({ refundStatus: "stuck", refundRid: rid, refundTxid: txid, lastError: raw.slice(0, 500) }).catch(() => {});
+    } else {
+      if (rid) { try { await pi().cancelPayment(rid); } catch {} }
+      await pref.update({ refundStatus: "failed", refundRid: null, lastError: raw.slice(0, 500) }).catch(() => {});
+    }
+    throw new Error(friendlyRefundError(raw));
   }
   try {
     await pref.update({
@@ -353,7 +424,7 @@ async function refundPayment(paymentId, reason, by) {
       refundAmount: refundAmt, refundDeduction: REFUND_DEDUCT,
       refundReason: clean(reason, 200), refundedBy: by
     });
-  } catch (e) { console.error("Refund sent but DB update failed:", paymentId, txid, e.message); }
+  } catch (e) { console.error("Refund sent but DB update failed:", paymentId, txid, errInfo(e)); }
   return { txid, amount: refundAmt };
 }
 
@@ -381,15 +452,15 @@ app.post("/api/admin/moderate", wrap(async (req, res) => {
   // استرجاع رسوم هذا العنصر فقط (المحل: رسوم المحل، المنتج: رسوم المنتج)
   const feeType = type === "shop" ? "shop_fee" : "product_fee";
   const ps = await db.collection("payments").where("targetId", "==", String(id)).get();
-  let refunded = 0, failed = 0, total = 0;
+  let refunded = 0, failed = 0, total = 0, lastErr = "";
   for (const d of ps.docs) {
     const x = d.data();
-    if (x.type !== feeType || !["none", "failed"].includes(x.refundStatus)) continue;
+    if (x.type !== feeType || !["none", "failed", "stuck"].includes(x.refundStatus)) continue;
     try { const r = await refundPayment(d.id, msg, u.username); refunded++; total += r.amount; }
-    catch (e) { failed++; console.error("Refund failed:", d.id, e.message); }
+    catch (e) { failed++; lastErr = e.message; console.error("Refund failed:", d.id, e.message); }
   }
   if (refunded) await ref.update({ feePaid: false });
-  res.json({ success: true, refunded, failed, amount: Number(total.toFixed(7)) });
+  res.json({ success: true, refunded, failed, amount: Number(total.toFixed(7)), error: lastErr });
 }));
 
 /* إعادة محاولة استرجاع فاشل: مسموح فقط إذا كان المحل/المنتج محذوفاً */
