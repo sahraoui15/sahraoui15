@@ -11,10 +11,8 @@ const env = process.env;
 
 /* ===== الإعدادات (يمكن تغييرها من Render بدون تعديل الكود) ===== */
 const SHOP_FEE = Number(env.SHOP_FEE || 5);          // رسوم فتح المحل
-const PRODUCT_FEE = Number(env.PRODUCT_FEE || 0.25); // رسوم إضافة منتج
-const REFUND_DEDUCT = Number(env.REFUND_DEDUCT ?? 0.01);
-// خصم منفصل لاسترجاع رسوم المنتجات (افتراضياً نفس REFUND_DEDUCT). ضعه 0 لاسترجاع المنتج كاملاً
-const PRODUCT_REFUND_DEDUCT = Number(env.PRODUCT_REFUND_DEDUCT ?? REFUND_DEDUCT);
+const PRODUCT_FEE = Number(env.PRODUCT_FEE || 0.25); // رسوم إضافة منتج (غير قابلة للاسترجاع أبداً)
+const REFUND_DEDUCT = Number(env.REFUND_DEDUCT ?? 0.01); // خصم رسوم الشبكة من استرجاع رسوم فتح المحل
 const ADMINS = (env.ADMIN_USERNAMES || "").split(",").map(s => s.trim().replace(/^@/, "").toLowerCase()).filter(Boolean);
 const PI_API = "https://api.minepi.com/v2";
 const PI_KEY = env.PI_API_KEY;
@@ -311,13 +309,16 @@ app.post("/api/pay/complete", wrap(async (req, res) => {
     });
     if (!r.ok) throw new Error(await r.text());
   }
-  // إذا كان العنصر منشوراً مسبقاً (دفعة مكررة) نسجّلها فقط ليتمكن الأدمن من استرجاعها
+  // إذا كان العنصر منشوراً مسبقاً (دفعة مكررة) نسجّلها فقط
   const fresh = c.d.status === "unpaid";
   const b = db.batch();
   if (fresh) b.update(c.ref, { status: "live", feePaid: true, publishedAt: Date.now() });
   b.set(db.collection("payments").doc(pid), {
     userUid: p.user_uid, type: c.type, targetId: c.targetId, targetName: c.d.name,
-    amount: c.fee, txid: tx, paidAt: Date.now(), refundStatus: "none", duplicate: !fresh
+    amount: c.fee, txid: tx, paidAt: Date.now(),
+    // رسوم المنتجات غير قابلة للاسترجاع أبداً، أما رسوم المحل فتبدأ بـ none
+    refundStatus: c.type === "product_fee" ? "nonrefundable" : "none",
+    duplicate: !fresh
   });
   await b.commit();
   res.json({ success: true });
@@ -349,7 +350,117 @@ app.post("/api/admin/list", wrap(async (req, res) => {
   });
 }));
 
-/* ===== الاسترجاع (التطبيق إلى المستخدم - A2U) ===== */
+/* ===== إحصائيات الأدمن ===== */
+let statsCache = { k: "", t: 0, d: null };
+app.post("/api/admin/stats", wrap(async (req, res) => {
+  const u = await adminOnly(req, res); if (!u) return;
+  const tz = Math.max(-840, Math.min(840, Math.round(Number(req.body.tz)) || 0)); // فرق التوقيت بالدقائق (من المتصفح)
+  const now = Date.now();
+  if (!req.body.force && statsCache.d && statsCache.k === String(tz) && now - statsCache.t < 15000) return res.json(statsCache.d);
+
+  const [s, p, y] = await Promise.all([
+    db.collection("shops").select("name", "status", "country", "createdAt", "ownerUid").get(),
+    db.collection("products").select("status", "shopId", "createdAt").get(),
+    db.collection("payments").select("type", "amount", "paidAt", "refundStatus", "refundAmount", "refundDeduction", "duplicate", "targetName").get()
+  ]);
+
+  const r = n => Number(Number(n || 0).toFixed(7));
+  const dk = ts => { const n = Number(ts); return n > 0 ? new Date(n - tz * 60000).toISOString().slice(0, 10) : ""; };
+  const today = dk(now);
+  const DAY = 86400000;
+
+  const days = [];
+  for (let i = 13; i >= 0; i--) days.push(dk(now - i * DAY));
+  const rev = {}, ns = {}, np = {};
+  days.forEach(d => { rev[d] = 0; ns[d] = 0; np[d] = 0; });
+
+  const z = () => ({ revenue: 0, shops: 0, products: 0 });
+  const per = { today: z(), d7: z(), d30: z(), all: z() };
+  const addTo = (ts, field, val) => {
+    const n = Number(ts) || 0;
+    per.all[field] += val;
+    if (n && now - n < 30 * DAY) per.d30[field] += val;
+    if (n && now - n < 7 * DAY) per.d7[field] += val;
+    if (n && dk(n) === today) per.today[field] += val;
+  };
+
+  const cnt = () => ({ total: 0, live: 0, unpaid: 0, removed: 0, refunded: 0 });
+  const sc = cnt(), pc = cnt();
+  const owners = new Set(), info = {}, byCountry = {}, perShop = {};
+
+  s.forEach(d => {
+    const x = d.data();
+    const st = ["live", "unpaid", "removed", "refunded"].includes(x.status) ? x.status : "unpaid";
+    sc.total++; sc[st]++;
+    if (x.ownerUid) owners.add(x.ownerUid);
+    info[d.id] = { name: x.name || "", country: x.country || "", live: x.status === "live" };
+    addTo(x.createdAt, "shops", 1);
+    const k = dk(x.createdAt); if (k in ns) ns[k]++;
+    if (x.status === "live") {
+      const c = x.country || "--";
+      (byCountry[c] = byCountry[c] || { shops: 0, products: 0 }).shops++;
+    }
+  });
+
+  p.forEach(d => {
+    const x = d.data();
+    const st = ["live", "unpaid", "removed", "refunded"].includes(x.status) ? x.status : "unpaid";
+    pc.total++; pc[st]++;
+    addTo(x.createdAt, "products", 1);
+    const k = dk(x.createdAt); if (k in np) np[k]++;
+    const sh = info[x.shopId];
+    if (x.status === "live" && sh && sh.live) {
+      perShop[x.shopId] = (perShop[x.shopId] || 0) + 1;
+      const c = sh.country || "--";
+      (byCountry[c] = byCountry[c] || { shops: 0, products: 0 }).products++;
+    }
+  });
+
+  const m = { shopFees: 0, productFees: 0, refunded: 0, kept: 0 };
+  const rs = { refunded: 0, failed: 0, stuck: 0, processing: 0 };
+  let dups = 0;
+  const recent = [];
+  y.forEach(d => {
+    const x = d.data();
+    const a = Number(x.amount) || 0;
+    if (x.type === "shop_fee") m.shopFees += a; else m.productFees += a;
+    if (x.duplicate) dups++;
+    addTo(x.paidAt, "revenue", a);
+    const k = dk(x.paidAt); if (k in rev) rev[k] += a;
+    if (x.type === "shop_fee") {
+      if (x.refundStatus === "refunded") { m.refunded += Number(x.refundAmount) || 0; m.kept += Number(x.refundDeduction) || 0; rs.refunded++; }
+      else if (["failed", "stuck", "processing"].includes(x.refundStatus)) rs[x.refundStatus]++;
+    }
+    recent.push({ name: x.targetName || "", type: x.type, amount: a, paidAt: Number(x.paidAt) || 0, refundStatus: x.refundStatus || "none" });
+  });
+  recent.sort((a, b) => b.paidAt - a.paidAt);
+
+  const countries = Object.entries(byCountry)
+    .map(([code, v]) => ({ code, shops: v.shops, products: v.products }))
+    .sort((a, b) => b.shops - a.shops || b.products - a.products).slice(0, 8);
+  const topShops = Object.entries(perShop)
+    .map(([id, n]) => ({ name: (info[id] && info[id].name) || "", country: (info[id] && info[id].country) || "", products: n }))
+    .sort((a, b) => b.products - a.products).slice(0, 5);
+
+  const collected = m.shopFees + m.productFees;
+  const fixPer = o => ({ revenue: r(o.revenue), shops: o.shops, products: o.products });
+  const out = {
+    at: now, days,
+    revDay: days.map(d => r(rev[d])), shopsDay: days.map(d => ns[d]), prodsDay: days.map(d => np[d]),
+    shops: sc, products: pc, owners: owners.size,
+    money: { shopFees: r(m.shopFees), productFees: r(m.productFees), collected: r(collected), refunded: r(m.refunded), kept: r(m.kept), net: r(collected - m.refunded) },
+    payments: { total: y.size, duplicates: dups, refunds: rs },
+    periods: { today: fixPer(per.today), d7: fixPer(per.d7), d30: fixPer(per.d30), all: fixPer(per.all) },
+    countries, topShops, recent: recent.slice(0, 8),
+    alerts: { failedRefunds: rs.failed, stuckRefunds: rs.stuck, processing: rs.processing, duplicates: dups, unpaidShops: sc.unpaid, unpaidProducts: pc.unpaid }
+  };
+  statsCache = { k: String(tz), t: now, d: out };
+  res.json(out);
+}));
+
+/* ===== الاسترجاع (التطبيق إلى المستخدم - A2U) =====
+   القاعدة: الاسترجاع متاح فقط لرسوم فتح المحل (shop_fee).
+   رسوم المنتجات (product_fee) غير قابلة للاسترجاع أبداً. */
 
 /* ينظّف دفعات A2U العالقة. إن وجد دفعة استرجاع لنفس الدفعة لها txid يُكملها ويعيدها (لمنع الاسترجاع المزدوج) */
 async function clearStuck(paymentId) {
@@ -378,7 +489,7 @@ async function clearStuck(paymentId) {
   return resumed;
 }
 
-/* استرجاع دفعة واحدة. لا يُستدعى إلا بعد حذف المحل/المنتج من قبل المطور */
+/* استرجاع دفعة رسوم محل. لا يُستدعى إلا بعد حذف المحل من قبل المطور */
 async function refundPayment(paymentId, reason, by) {
   const pref = db.collection("payments").doc(String(paymentId));
   // قفل لمنع الاسترجاع المزدوج
@@ -386,12 +497,13 @@ async function refundPayment(paymentId, reason, by) {
     const s = await t.get(pref);
     if (!s.exists) throw new Error("Payment not found");
     const d = s.data();
+    if (d.type !== "shop_fee") throw new Error("Product fees are non-refundable");
     if (!["none", "failed", "stuck"].includes(d.refundStatus)) throw new Error("Already refunded or processing");
     t.update(pref, { refundStatus: "processing" });
     return d;
   });
-  // المبلغ المسترجع = المبلغ المدفوع ناقص الخصم (مثلاً 5 - 0.01 = 4.99)
-  const deduct = info.type === "product_fee" ? PRODUCT_REFUND_DEDUCT : REFUND_DEDUCT;
+  // المبلغ المسترجع = رسوم المحل المدفوعة ناقص خصم الشبكة (مثلاً 5 - 0.01 = 4.99)
+  const deduct = REFUND_DEDUCT;
   const refundAmt = Number((Number(info.amount) - deduct).toFixed(7));
   if (!(refundAmt > 0)) {
     await pref.update({ refundStatus: "failed" }).catch(() => {});
@@ -437,7 +549,7 @@ async function refundPayment(paymentId, reason, by) {
   return { txid, amount: refundAmt };
 }
 
-/* ===== الحذف النهائي (Firestore + Cloudinary) بعد نجاح الاسترجاع ===== */
+/* ===== الحذف النهائي (Firestore + Cloudinary) ===== */
 
 /* استخراج public_id من رابط Cloudinary، ولا نحذف إلا صور مجلد هذا المستخدم */
 function cloudId(url, ownerUid) {
@@ -466,40 +578,27 @@ async function purgeDoc(ref, data) {
   await ref.delete();
 }
 
-/* هل استُرجعت كل دفعات هذا العنصر؟ (أو لا توجد دفعات أصلاً) */
+/* هل استُرجعت كل دفعات رسوم هذا العنصر؟ (أو لا توجد دفعات أصلاً) */
 async function canPurge(feeType, id) {
   const ps = await db.collection("payments").where("targetId", "==", String(id)).get();
   return ps.docs.every(d => { const x = d.data(); return x.type !== feeType || x.refundStatus === "refunded"; });
 }
 
-/* استرجاع كل دفعات عنصر معيّن (للمنتجات التابعة لمحل يُحذف) */
-async function refundTarget(feeType, id, msg, by, acc) {
-  const ps = await db.collection("payments").where("targetId", "==", String(id)).get();
-  for (const d of ps.docs) {
-    const x = d.data();
-    if (x.type !== feeType || !["none", "failed", "stuck"].includes(x.refundStatus)) continue;
-    try { const r = await refundPayment(d.id, msg, by); acc.refunded++; acc.total += r.amount; }
-    catch (e) { acc.failed++; acc.lastErr = e.message; console.error("Refund failed:", d.id, e.message); }
-  }
-}
-
-/* يحذف العنصر نهائياً فقط إذا استُرجعت رسومه بالكامل. المحل يحذف معه منتجاته (بعد استرجاع رسومها) */
-async function finalizeRemoval(type, id, ref, data, msg, by, acc) {
-  const feeType = type === "shop" ? "shop_fee" : "product_fee";
-  if (!(await canPurge(feeType, id))) return false;
+/* يحذف العنصر نهائياً.
+   - المنتج: يُحذف مباشرة (رسومه غير قابلة للاسترجاع).
+   - المحل: يُحذف فقط بعد استرجاع رسوم فتحه بالكامل، ويُحذف معه كل منتجاته بدون أي استرجاع لرسومها. */
+async function finalizeRemoval(type, id, ref, data) {
   if (type === "shop") {
+    if (!(await canPurge("shop_fee", id))) return false;
     const pq = await db.collection("products").where("shopId", "==", String(id)).get();
-    for (const pd of pq.docs) {
-      await refundTarget("product_fee", pd.id, msg, by, acc);
-      if (await canPurge("product_fee", pd.id)) await purgeDoc(pd.ref, pd.data());
-      else await pd.ref.update({ status: "removed", reviewMessage: msg, reviewedAt: Date.now() }).catch(() => {});
-    }
+    for (const pd of pq.docs) await purgeDoc(pd.ref, pd.data());
   }
   await purgeDoc(ref, data);
   return true;
 }
 
-/* حذف محل/منتج (يسترجع رسومه تلقائياً ثم يُمحى نهائياً) أو استعادته */
+/* حذف محل/منتج أو استعادته.
+   حذف المحل: يسترجع رسوم فتح المحل فقط ثم يمحى نهائياً مع منتجاته. حذف المنتج: بدون أي استرجاع. */
 app.post("/api/admin/moderate", wrap(async (req, res) => {
   const u = await adminOnly(req, res); if (!u) return;
   const { type, id, action, message } = req.body;
@@ -520,23 +619,23 @@ app.post("/api/admin/moderate", wrap(async (req, res) => {
   if (!msg) return res.status(400).json({ error: "Reason required" });
   await ref.update({ status: "removed", reviewMessage: msg, reviewedAt: Date.now() });
 
-  // استرجاع رسوم هذا العنصر فقط (المحل: رسوم المحل، المنتج: رسوم المنتج)
-  const feeType = type === "shop" ? "shop_fee" : "product_fee";
-  const ps = await db.collection("payments").where("targetId", "==", String(id)).get();
   let refunded = 0, failed = 0, total = 0, lastErr = "";
-  for (const d of ps.docs) {
-    const x = d.data();
-    if (x.type !== feeType || !["none", "failed", "stuck"].includes(x.refundStatus)) continue;
-    try { const r = await refundPayment(d.id, msg, u.username); refunded++; total += r.amount; }
-    catch (e) { failed++; lastErr = e.message; console.error("Refund failed:", d.id, e.message); }
+  if (type === "shop") {
+    // استرجاع رسوم فتح المحل فقط
+    const ps = await db.collection("payments").where("targetId", "==", String(id)).get();
+    for (const d of ps.docs) {
+      const x = d.data();
+      if (x.type !== "shop_fee" || !["none", "failed", "stuck"].includes(x.refundStatus)) continue;
+      try { const r = await refundPayment(d.id, msg, u.username); refunded++; total += r.amount; }
+      catch (e) { failed++; lastErr = e.message; console.error("Refund failed:", d.id, e.message); }
+    }
   }
-  const acc = { refunded, failed, total, lastErr };
-  const deleted = await finalizeRemoval(type, String(id), ref, s.data(), msg, u.username, acc);
+  const deleted = await finalizeRemoval(type, String(id), ref, s.data());
   if (!deleted && refunded) await ref.update({ feePaid: false });
-  res.json({ success: true, refunded: acc.refunded, failed: acc.failed, amount: Number(acc.total.toFixed(7)), error: acc.lastErr, deleted });
+  res.json({ success: true, refunded, failed, amount: Number(total.toFixed(7)), error: lastErr, deleted });
 }));
 
-/* إعادة محاولة استرجاع فاشل: مسموح فقط إذا كان المحل/المنتج محذوفاً */
+/* إعادة محاولة استرجاع فاشل: مسموح فقط لرسوم المحل، وفقط إذا كان المحل محذوفاً */
 app.post("/api/admin/refund", wrap(async (req, res) => {
   const u = await adminOnly(req, res); if (!u) return;
   const { paymentId, reason } = req.body;
@@ -544,14 +643,12 @@ app.post("/api/admin/refund", wrap(async (req, res) => {
   const ps = await db.collection("payments").doc(String(paymentId)).get();
   if (!ps.exists) return res.status(404).json({ error: "Payment not found" });
   const x = ps.data();
-  const col = x.type === "shop_fee" ? "shops" : "products";
-  const tg = await db.collection(col).doc(String(x.targetId)).get();
+  if (x.type !== "shop_fee") return res.status(400).json({ error: "Product fees are non-refundable" });
+  const tg = await db.collection("shops").doc(String(x.targetId)).get();
   if (!tg.exists || tg.data().status !== "removed")
-    return res.status(400).json({ error: "Remove the shop/product first. Refunds happen only after removal." });
+    return res.status(400).json({ error: "Remove the shop first. Refunds happen only after removal." });
   const r = await refundPayment(paymentId, reason || tg.data().reviewMessage, u.username);
-  const acc = { refunded: 1, failed: 0, total: r.amount, lastErr: "" };
-  const deleted = await finalizeRemoval(x.type === "shop_fee" ? "shop" : "product", String(x.targetId), tg.ref, tg.data(),
-    clean(reason || tg.data().reviewMessage || "", 300), u.username, acc);
+  const deleted = await finalizeRemoval("shop", String(x.targetId), tg.ref, tg.data());
   if (!deleted) await tg.ref.update({ feePaid: false });
   res.json({ success: true, txid: r.txid, amount: r.amount, deleted });
 }));
