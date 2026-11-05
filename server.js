@@ -13,6 +13,8 @@ const env = process.env;
 const SHOP_FEE = Number(env.SHOP_FEE || 5);          // رسوم فتح المحل
 const PRODUCT_FEE = Number(env.PRODUCT_FEE || 0.25); // رسوم إضافة منتج
 const REFUND_DEDUCT = Number(env.REFUND_DEDUCT ?? 0.01);
+// خصم منفصل لاسترجاع رسوم المنتجات (افتراضياً نفس REFUND_DEDUCT). ضعه 0 لاسترجاع المنتج كاملاً
+const PRODUCT_REFUND_DEDUCT = Number(env.PRODUCT_REFUND_DEDUCT ?? REFUND_DEDUCT);
 const ADMINS = (env.ADMIN_USERNAMES || "").split(",").map(s => s.trim().replace(/^@/, "").toLowerCase()).filter(Boolean);
 const PI_API = "https://api.minepi.com/v2";
 const PI_KEY = env.PI_API_KEY;
@@ -389,7 +391,8 @@ async function refundPayment(paymentId, reason, by) {
     return d;
   });
   // المبلغ المسترجع = المبلغ المدفوع ناقص الخصم (مثلاً 5 - 0.01 = 4.99)
-  const refundAmt = Number((Number(info.amount) - REFUND_DEDUCT).toFixed(7));
+  const deduct = info.type === "product_fee" ? PRODUCT_REFUND_DEDUCT : REFUND_DEDUCT;
+  const refundAmt = Number((Number(info.amount) - deduct).toFixed(7));
   if (!(refundAmt > 0)) {
     await pref.update({ refundStatus: "failed" }).catch(() => {});
     throw new Error("Refund amount too small");
@@ -427,14 +430,76 @@ async function refundPayment(paymentId, reason, by) {
   try {
     await pref.update({
       refundStatus: "refunded", refundTxid: txid, refundedAt: Date.now(),
-      refundAmount: refundAmt, refundDeduction: REFUND_DEDUCT,
+      refundAmount: refundAmt, refundDeduction: deduct,
       refundReason: clean(reason, 200), refundedBy: by
     });
   } catch (e) { console.error("Refund sent but DB update failed:", paymentId, txid, errInfo(e)); }
   return { txid, amount: refundAmt };
 }
 
-/* حذف محل/منتج (يسترجع رسومه تلقائياً) أو استعادته */
+/* ===== الحذف النهائي (Firestore + Cloudinary) بعد نجاح الاسترجاع ===== */
+
+/* استخراج public_id من رابط Cloudinary، ولا نحذف إلا صور مجلد هذا المستخدم */
+function cloudId(url, ownerUid) {
+  try {
+    const u = String(url || "");
+    if (!u.startsWith("https://res.cloudinary.com/")) return null;
+    if (env.CLOUDINARY_CLOUD_NAME && !u.startsWith(`https://res.cloudinary.com/${env.CLOUDINARY_CLOUD_NAME}/`)) return null;
+    const i = u.indexOf("/upload/");
+    if (i < 0) return null;
+    let p = decodeURIComponent(u.slice(i + 8).split("?")[0]);
+    const j = p.indexOf("parfum/");
+    if (j < 0) return null;
+    p = p.slice(j).replace(/\.[a-z0-9]+$/i, "");
+    if (!ownerUid || !p.startsWith("parfum/" + ownerUid + "/")) return null;
+    return p;
+  } catch { return null; }
+}
+async function destroyImage(url, ownerUid) {
+  const id = cloudId(url, ownerUid);
+  if (!id) return;
+  try { await cloudinary.v2.uploader.destroy(id, { invalidate: true }); }
+  catch (e) { console.error("cloudinary destroy:", id, errInfo(e)); }
+}
+async function purgeDoc(ref, data) {
+  await destroyImage(data && data.image, data && data.ownerUid);
+  await ref.delete();
+}
+
+/* هل استُرجعت كل دفعات هذا العنصر؟ (أو لا توجد دفعات أصلاً) */
+async function canPurge(feeType, id) {
+  const ps = await db.collection("payments").where("targetId", "==", String(id)).get();
+  return ps.docs.every(d => { const x = d.data(); return x.type !== feeType || x.refundStatus === "refunded"; });
+}
+
+/* استرجاع كل دفعات عنصر معيّن (للمنتجات التابعة لمحل يُحذف) */
+async function refundTarget(feeType, id, msg, by, acc) {
+  const ps = await db.collection("payments").where("targetId", "==", String(id)).get();
+  for (const d of ps.docs) {
+    const x = d.data();
+    if (x.type !== feeType || !["none", "failed", "stuck"].includes(x.refundStatus)) continue;
+    try { const r = await refundPayment(d.id, msg, by); acc.refunded++; acc.total += r.amount; }
+    catch (e) { acc.failed++; acc.lastErr = e.message; console.error("Refund failed:", d.id, e.message); }
+  }
+}
+
+/* يحذف العنصر نهائياً فقط إذا استُرجعت رسومه بالكامل. المحل يحذف معه منتجاته (بعد استرجاع رسومها) */
+async function finalizeRemoval(type, id, ref, data, msg, by, acc) {
+  const feeType = type === "shop" ? "shop_fee" : "product_fee";
+  if (!(await canPurge(feeType, id))) return false;
+  if (type === "shop") {
+    const pq = await db.collection("products").where("shopId", "==", String(id)).get();
+    for (const pd of pq.docs) {
+      await refundTarget("product_fee", pd.id, msg, by, acc);
+      if (await canPurge("product_fee", pd.id)) await purgeDoc(pd.ref, pd.data());
+      else await pd.ref.update({ status: "removed", reviewMessage: msg, reviewedAt: Date.now() }).catch(() => {});
+    }
+  }
+  await purgeDoc(ref, data);
+  return true;
+}
+
+/* حذف محل/منتج (يسترجع رسومه تلقائياً ثم يُمحى نهائياً) أو استعادته */
 app.post("/api/admin/moderate", wrap(async (req, res) => {
   const u = await adminOnly(req, res); if (!u) return;
   const { type, id, action, message } = req.body;
@@ -465,8 +530,10 @@ app.post("/api/admin/moderate", wrap(async (req, res) => {
     try { const r = await refundPayment(d.id, msg, u.username); refunded++; total += r.amount; }
     catch (e) { failed++; lastErr = e.message; console.error("Refund failed:", d.id, e.message); }
   }
-  if (refunded) await ref.update({ feePaid: false });
-  res.json({ success: true, refunded, failed, amount: Number(total.toFixed(7)), error: lastErr });
+  const acc = { refunded, failed, total, lastErr };
+  const deleted = await finalizeRemoval(type, String(id), ref, s.data(), msg, u.username, acc);
+  if (!deleted && refunded) await ref.update({ feePaid: false });
+  res.json({ success: true, refunded: acc.refunded, failed: acc.failed, amount: Number(acc.total.toFixed(7)), error: acc.lastErr, deleted });
 }));
 
 /* إعادة محاولة استرجاع فاشل: مسموح فقط إذا كان المحل/المنتج محذوفاً */
@@ -482,8 +549,11 @@ app.post("/api/admin/refund", wrap(async (req, res) => {
   if (!tg.exists || tg.data().status !== "removed")
     return res.status(400).json({ error: "Remove the shop/product first. Refunds happen only after removal." });
   const r = await refundPayment(paymentId, reason || tg.data().reviewMessage, u.username);
-  await tg.ref.update({ feePaid: false });
-  res.json({ success: true, txid: r.txid, amount: r.amount });
+  const acc = { refunded: 1, failed: 0, total: r.amount, lastErr: "" };
+  const deleted = await finalizeRemoval(x.type === "shop_fee" ? "shop" : "product", String(x.targetId), tg.ref, tg.data(),
+    clean(reason || tg.data().reviewMessage || "", 300), u.username, acc);
+  if (!deleted) await tg.ref.update({ feePaid: false });
+  res.json({ success: true, txid: r.txid, amount: r.amount, deleted });
 }));
 
 /* ===== الواجهة (اختياري: إذا وُجد مجلد public) ===== */
