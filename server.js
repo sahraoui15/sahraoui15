@@ -353,8 +353,14 @@ app.post("/api/admin/list", wrap(async (req, res) => {
 async function clearStuck(paymentId) {
   let resumed = null;
   let list = [];
-  try { list = (await pi().getIncompleteServerPayments()) || []; }
-  catch (e) { console.error("getIncomplete:", errInfo(e)); return null; }
+  try {
+    const raw = await pi().getIncompleteServerPayments();
+    // قد ترجع المكتبة مصفوفة أو كائناً يحتوي المصفوفة
+    if (Array.isArray(raw)) list = raw;
+    else if (raw && Array.isArray(raw.incomplete_server_payments)) list = raw.incomplete_server_payments;
+    else if (raw && Array.isArray(raw.data)) list = raw.data;
+    else list = [];
+  } catch (e) { console.error("getIncomplete:", errInfo(e)); return null; }
   for (const p of list) {
     const tx = p.transaction && p.transaction.txid;
     const mine = p.metadata && String(p.metadata.paymentId) === String(paymentId);
