@@ -146,7 +146,7 @@ app.get("/api/config", (_, res) => {
   });
 });
 
-/* المحلات المنشورة مع منتجاتها المنشورة */
+/* المحلات المنشورة مع منتجاتها المنشورة (المحلات قيد المراجعة لا تظهر) */
 app.get("/api/shops", wrap(async (_, res) => {
   const [s, p] = await Promise.all([
     db.collection("shops").where("status", "==", "live").get(),
@@ -188,7 +188,10 @@ app.post("/api/upload", wrap(async (req, res) => {
   res.json({ url: r.secure_url });
 }));
 
-/* ===== المحل: حفظ البيانات (الحالة الأولى unpaid حتى يتم دفع 5 Pi) ===== */
+/* ===== المحل: حفظ البيانات =====
+   دورة حياة المحل:
+   unpaid  → (دفع 5 Pi) → pending (قيد المراجعة) → live (قبول الأدمن)
+   pending → (رفض الأدمن + استرجاع الرسوم) → refunded (مع سبب الرفض، ويمكن للمالك التعديل والدفع من جديد) */
 app.post("/api/shop/save", wrap(async (req, res) => {
   const u = await auth(req, res); if (!u) return;
   const b = req.body;
@@ -309,10 +312,15 @@ app.post("/api/pay/complete", wrap(async (req, res) => {
     });
     if (!r.ok) throw new Error(await r.text());
   }
-  // إذا كان العنصر منشوراً مسبقاً (دفعة مكررة) نسجّلها فقط
+  // إذا كان العنصر مدفوعاً مسبقاً (دفعة مكررة) نسجّلها فقط
   const fresh = c.d.status === "unpaid";
   const b = db.batch();
-  if (fresh) b.update(c.ref, { status: "live", feePaid: true, publishedAt: Date.now() });
+  if (fresh) {
+    // المحل بعد الدفع يذهب إلى المراجعة (pending) ولا يُنشر مباشرة. أما المنتج فيُنشر مباشرة.
+    b.update(c.ref, c.type === "shop_fee"
+      ? { status: "pending", feePaid: true, reviewMessage: "", submittedAt: Date.now() }
+      : { status: "live", feePaid: true, publishedAt: Date.now() });
+  }
   b.set(db.collection("payments").doc(pid), {
     userUid: p.user_uid, type: c.type, targetId: c.targetId, targetName: c.d.name,
     amount: c.fee, txid: tx, paidAt: Date.now(),
@@ -335,7 +343,11 @@ app.post("/api/admin/list", wrap(async (req, res) => {
   const names = {};
   const shops = s.docs.map(d => {
     const x = d.data(); names[d.id] = x.name;
-    return { id: d.id, name: x.name, country: x.country, region: x.region, ownerUsername: x.ownerUsername, status: x.status, image: x.image || "", createdAt: x.createdAt || 0 };
+    return {
+      id: d.id, name: x.name, country: x.country, region: x.region, ownerUsername: x.ownerUsername, status: x.status,
+      image: x.image || "", address: x.address || "", phone: x.phone || "", hours: x.hours || "", description: x.description || "",
+      createdAt: x.createdAt || 0, submittedAt: x.submittedAt || 0
+    };
   }).sort((a, b) => b.createdAt - a.createdAt);
   const products = p.docs.map(d => {
     const x = d.data();
@@ -384,13 +396,14 @@ app.post("/api/admin/stats", wrap(async (req, res) => {
     if (n && dk(n) === today) per.today[field] += val;
   };
 
-  const cnt = () => ({ total: 0, live: 0, unpaid: 0, removed: 0, refunded: 0 });
+  const cnt = () => ({ total: 0, live: 0, pending: 0, unpaid: 0, removed: 0, refunded: 0 });
   const sc = cnt(), pc = cnt();
   const owners = new Set(), info = {}, byCountry = {}, perShop = {};
+  const STATES = ["live", "pending", "unpaid", "removed", "refunded"];
 
   s.forEach(d => {
     const x = d.data();
-    const st = ["live", "unpaid", "removed", "refunded"].includes(x.status) ? x.status : "unpaid";
+    const st = STATES.includes(x.status) ? x.status : "unpaid";
     sc.total++; sc[st]++;
     if (x.ownerUid) owners.add(x.ownerUid);
     info[d.id] = { name: x.name || "", country: x.country || "", live: x.status === "live" };
@@ -404,7 +417,7 @@ app.post("/api/admin/stats", wrap(async (req, res) => {
 
   p.forEach(d => {
     const x = d.data();
-    const st = ["live", "unpaid", "removed", "refunded"].includes(x.status) ? x.status : "unpaid";
+    const st = STATES.includes(x.status) ? x.status : "unpaid";
     pc.total++; pc[st]++;
     addTo(x.createdAt, "products", 1);
     const k = dk(x.createdAt); if (k in np) np[k]++;
@@ -448,11 +461,12 @@ app.post("/api/admin/stats", wrap(async (req, res) => {
     at: now, days,
     revDay: days.map(d => r(rev[d])), shopsDay: days.map(d => ns[d]), prodsDay: days.map(d => np[d]),
     shops: sc, products: pc, owners: owners.size,
-    money: { shopFees: r(m.shopFees), productFees: r(m.productFees), collected: r(collected), refunded: r(m.refunded), kept: r(m.kept), net: r(collected - m.refunded) },
+    /* الصافي = المحصّل − المسترجع للمالكين − رسوم الشبكة المدفوعة (رسوم الشبكة ليست ربحاً) */
+    money: { shopFees: r(m.shopFees), productFees: r(m.productFees), collected: r(collected), refunded: r(m.refunded), kept: r(m.kept), net: r(collected - m.refunded - m.kept) },
     payments: { total: y.size, duplicates: dups, refunds: rs },
     periods: { today: fixPer(per.today), d7: fixPer(per.d7), d30: fixPer(per.d30), all: fixPer(per.all) },
     countries, topShops, recent: recent.slice(0, 8),
-    alerts: { failedRefunds: rs.failed, stuckRefunds: rs.stuck, processing: rs.processing, duplicates: dups, unpaidShops: sc.unpaid, unpaidProducts: pc.unpaid }
+    alerts: { pendingShops: sc.pending, failedRefunds: rs.failed, stuckRefunds: rs.stuck, processing: rs.processing, duplicates: dups, unpaidShops: sc.unpaid, unpaidProducts: pc.unpaid }
   };
   statsCache = { k: String(tz), t: now, d: out };
   res.json(out);
@@ -489,7 +503,7 @@ async function clearStuck(paymentId) {
   return resumed;
 }
 
-/* استرجاع دفعة رسوم محل. لا يُستدعى إلا بعد حذف المحل من قبل المطور */
+/* استرجاع دفعة رسوم محل. لا يُستدعى إلا بعد حذف المحل أو رفضه من قبل المطور */
 async function refundPayment(paymentId, reason, by) {
   const pref = db.collection("payments").doc(String(paymentId));
   // قفل لمنع الاسترجاع المزدوج
@@ -597,12 +611,28 @@ async function finalizeRemoval(type, id, ref, data) {
   return true;
 }
 
-/* حذف محل/منتج أو استعادته.
-   حذف المحل: يسترجع رسوم فتح المحل فقط ثم يمحى نهائياً مع منتجاته. حذف المنتج: بدون أي استرجاع. */
+/* يسترجع كل دفعات رسوم فتح المحل القابلة للاسترجاع. يرجع ملخصاً بالنتيجة */
+async function refundShopFees(shopId, reason, by) {
+  let refunded = 0, failed = 0, total = 0, lastErr = "";
+  const ps = await db.collection("payments").where("targetId", "==", String(shopId)).get();
+  for (const d of ps.docs) {
+    const x = d.data();
+    if (x.type !== "shop_fee" || !["none", "failed", "stuck"].includes(x.refundStatus)) continue;
+    try { const r = await refundPayment(d.id, reason, by); refunded++; total += r.amount; }
+    catch (e) { failed++; lastErr = e.message; console.error("Refund failed:", d.id, e.message); }
+  }
+  return { refunded, failed, amount: Number(total.toFixed(7)), error: lastErr };
+}
+
+/* مراجعة وحذف محل/منتج أو استعادته.
+   - approve: قبول محل قيد المراجعة ونشره.
+   - reject : رفض محل قيد المراجعة + استرجاع رسوم فتحه (ناقص خصم الشبكة). إذا نجح الاسترجاع يصبح المحل refunded مع سبب الرفض
+              ويستطيع المالك تعديل بياناته والدفع من جديد. إذا فشل الاسترجاع يبقى المحل قيد المراجعة لإعادة المحاولة.
+   - remove : حذف المحل يسترجع رسوم فتح المحل فقط ثم يمحى نهائياً مع منتجاته. حذف المنتج: بدون أي استرجاع. */
 app.post("/api/admin/moderate", wrap(async (req, res) => {
   const u = await adminOnly(req, res); if (!u) return;
   const { type, id, action, message } = req.body;
-  if (!["shop", "product"].includes(type) || !["remove", "restore"].includes(action) || !id)
+  if (!["shop", "product"].includes(type) || !["remove", "restore", "approve", "reject"].includes(action) || !id)
     return res.status(400).json({ error: "Bad request" });
   const ref = db.collection(type === "shop" ? "shops" : "products").doc(String(id));
   const s = await ref.get();
@@ -615,6 +645,25 @@ app.post("/api/admin/moderate", wrap(async (req, res) => {
     return res.json({ success: true });
   }
 
+  if (action === "approve" || action === "reject") {
+    const d = s.data();
+    if (type !== "shop") return res.status(400).json({ error: "Only shops need review" });
+    if (d.status !== "pending") return res.status(400).json({ error: "Shop is not awaiting review" });
+    if (action === "approve") {
+      await ref.update({ status: "live", reviewMessage: "", reviewedAt: Date.now(), publishedAt: Date.now() });
+      return res.json({ success: true });
+    }
+    const why = clean(message, 300);
+    if (!why) return res.status(400).json({ error: "Reason required" });
+    const r = await refundShopFees(id, why, u.username);
+    if (r.failed) {
+      // فشل الاسترجاع: يبقى المحل قيد المراجعة ليعيد الأدمن المحاولة
+      return res.json({ success: true, rejected: false, refunded: r.refunded, failed: r.failed, amount: r.amount, error: r.error });
+    }
+    await ref.update({ status: "refunded", feePaid: false, reviewMessage: why, reviewedAt: Date.now() });
+    return res.json({ success: true, rejected: true, refunded: r.refunded, failed: 0, amount: r.amount, error: "" });
+  }
+
   const msg = clean(message, 300);
   if (!msg) return res.status(400).json({ error: "Reason required" });
   await ref.update({ status: "removed", reviewMessage: msg, reviewedAt: Date.now() });
@@ -622,13 +671,8 @@ app.post("/api/admin/moderate", wrap(async (req, res) => {
   let refunded = 0, failed = 0, total = 0, lastErr = "";
   if (type === "shop") {
     // استرجاع رسوم فتح المحل فقط
-    const ps = await db.collection("payments").where("targetId", "==", String(id)).get();
-    for (const d of ps.docs) {
-      const x = d.data();
-      if (x.type !== "shop_fee" || !["none", "failed", "stuck"].includes(x.refundStatus)) continue;
-      try { const r = await refundPayment(d.id, msg, u.username); refunded++; total += r.amount; }
-      catch (e) { failed++; lastErr = e.message; console.error("Refund failed:", d.id, e.message); }
-    }
+    const r = await refundShopFees(id, msg, u.username);
+    refunded = r.refunded; failed = r.failed; total = r.amount; lastErr = r.error;
   }
   const deleted = await finalizeRemoval(type, String(id), ref, s.data());
   if (!deleted && refunded) await ref.update({ feePaid: false });
