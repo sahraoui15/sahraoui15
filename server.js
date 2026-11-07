@@ -229,7 +229,7 @@ app.post("/api/product/save", wrap(async (req, res) => {
   const price = Number(b.price);
   const data = {
     name: clean(b.name, 80), brand: clean(b.brand, 60), size: clean(b.size, 30),
-    price, currency: clean(b.currency, 6).toUpperCase(), description: clean(b.description, 400),
+    price, currency: ({ PI: "Pi", OUSD: "OUSD" })[clean(b.currency, 6).toUpperCase()] || "", description: clean(b.description, 400),
     image: isImg(b.image) ? b.image : ""
   };
   if (!data.name || !(price > 0 && price < 1e9) || !data.currency || !data.image)
