@@ -281,10 +281,9 @@ app.delete('/api/products/:id', auth, wrap(async (req, res) => {
 }));
 
 /* ---------------------------- ORDERS ---------------------------- */
-const PHONE_DAILY_MAX = 10;  // max orders per phone number per day   <- change this number if you want
-const IP_HOURLY_MAX = 300;   // very high safety ceiling per network (many phones in Algeria share one IP)
+// الحد: 30 طلب في اليوم لكل رقم هاتف (يتجدد كل يوم حسب توقيت الجزائر). لا يوجد أي حد على الـ IP.
+const PHONE_DAILY_MAX = 30;  // max orders per phone number per day   <- change this number if you want
 const phoneDay = new Map();  // phone -> {day, n}
-const ordRate = new Map();   // ip -> {n, t}
 const recent = new Map();    // phone + basket -> {t, id}   (stops double-click duplicates)
 // "+213 555 12 34 56", "0555123456" and "00213555123456" are the same phone
 const normPhone = p => { let d = String(p).replace(/\D/g, '').replace(/^00/, ''); if (d.startsWith('213')) d = '0' + d.slice(3); return d; };
@@ -293,9 +292,6 @@ app.post('/api/orders', wrap(async (req, res) => {
   if (!name || !/^[0-9+\s]{9,15}$/.test(phone || '') || !wilaya || !FEES[delivery] || !Array.isArray(items) || !items.length)
     return res.status(400).json({ error: 'invalid' });
   const now = Date.now(), today = dayOf(now);
-  let r = ordRate.get(req.ip);
-  if (!r || now - r.t > 3600e3) r = { n: 0, t: now };
-  if (r.n >= IP_HOURLY_MAX) return res.status(429).json({ error: 'too many' });
   const byId = (await getProducts()).map;
   const lines = []; let subtotal = 0;
   for (const it of items.slice(0, 50)) {
@@ -315,7 +311,7 @@ app.post('/api/orders', wrap(async (req, res) => {
   let pr = phoneDay.get(key);
   if (!pr || pr.day !== today) pr = { day: today, n: 0 };
   if (pr.n >= PHONE_DAILY_MAX) return res.status(429).json({ error: 'phone limit' });
-  pr.n++; phoneDay.set(key, pr); r.n++; ordRate.set(req.ip, r);
+  pr.n++; phoneDay.set(key, pr);
   const order = { name: clean(name, 80), phone: ph, wilaya: clean(wilaya, 40), address: clean(address, 160), car: clean(car, 80), delivery,
     items: lines, subtotal, fee: FEES[delivery], total: subtotal + FEES[delivery], status: 'pending', reviewed: false, createdAt: stamp() };
   const ref = db.collection('orders').doc();
@@ -400,7 +396,6 @@ app.use((err, req, res, next) => { console.error(err.message); res.status(400).j
 setInterval(() => {
   const n = Date.now();
   for (const [k, v] of fails) if (n - v.t > 15 * 60e3) fails.delete(k);
-  for (const [k, v] of ordRate) if (n - v.t > 3600e3) ordRate.delete(k);
   for (const [k, v] of phoneDay) if (v.day !== dayOf(n)) phoneDay.delete(k);
   for (const [k, v] of recent) if (n - v.t > 120e3) recent.delete(k);
 }, 10 * 60e3).unref();
