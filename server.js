@@ -1,418 +1,660 @@
-const express = require('express');
-const admin = require('firebase-admin');
-const cloudinary = require('cloudinary').v2; // reads CLOUDINARY_URL automatically
-const multer = require('multer');
-const crypto = require('crypto');
-const path = require('path');
-const zlib = require('zlib');
-const fs = require('fs');
+import express from "express";
+import admin from "firebase-admin";
+import cloudinary from "cloudinary";
+import path from "path";
+import { fileURLToPath } from "url";
+import { createRequire } from "module";
 
-admin.initializeApp({ credential: admin.credential.cert(JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT)) });
+const require = createRequire(import.meta.url);
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const env = process.env;
+
+/* ===== الإعدادات (يمكن تغييرها من Render بدون تعديل الكود) ===== */
+const SHOP_FEE = Number(env.SHOP_FEE || 5);          // رسوم فتح المحل
+const PRODUCT_FEE = Number(env.PRODUCT_FEE || 0.25); // رسوم إضافة منتج (غير قابلة للاسترجاع أبداً)
+const REFUND_DEDUCT = Number(env.REFUND_DEDUCT ?? 0.01); // خصم رسوم الشبكة من استرجاع رسوم فتح المحل
+const ADMINS = (env.ADMIN_USERNAMES || "").split(",").map(s => s.trim().replace(/^@/, "").toLowerCase()).filter(Boolean);
+const PI_API = "https://api.minepi.com/v2";
+const PI_KEY = env.PI_API_KEY;
+
+/* العناوين المسموح لها باستدعاء السيرفر (واجهة GitHub Pages) */
+const ORIGINS = (env.ALLOWED_ORIGIN || "https://veoabdo.github.io")
+  .split(",").map(s => s.trim().replace(/\/$/, "")).filter(Boolean);
+
+/* ===== Firebase ===== */
+let serviceAccount;
+try {
+  serviceAccount = JSON.parse(env.FIREBASE_SERVICE_ACCOUNT);
+  if (serviceAccount.private_key) serviceAccount.private_key = serviceAccount.private_key.replace(/\\n/g, "\n");
+} catch (e) {
+  console.error("FIREBASE_SERVICE_ACCOUNT غير صالح: تأكد أنه JSON كامل");
+  throw e;
+}
+admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
 const db = admin.firestore();
-const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 6 * 1024 * 1024 },
-  fileFilter: (_, f, cb) => cb(null, /^image\/(jpeg|png|webp|gif)$/.test(f.mimetype)) });
-const SECRET = process.env.TOKEN_SECRET || 'change-me';
-const clean = (v, n) => String(v || '').trim().slice(0, n);
-const FEES = { home: 600, desk: 400 }; // delivery fees in DA (edit here and in index.html)
 
-const TZ = 3600e3; // Algeria = UTC+1 (no daylight saving)
-const dayOf = ts => new Date(ts + TZ).toISOString().slice(0, 10);          // "2026-11-07"
-const dayStart = day => Date.parse(day + 'T00:00:00Z') - TZ;
-let lastStamp = 0; // every order gets a different timestamp, so paging through a busy day never skips one
-const stamp = () => { const n = Date.now(); lastStamp = n > lastStamp ? n : lastStamp + 1; return lastStamp; };
-const acceptsGzip = req => /\bgzip\b/.test(req.headers['accept-encoding'] || '');
+cloudinary.v2.config({
+  cloud_name: env.CLOUDINARY_CLOUD_NAME,
+  api_key: env.CLOUDINARY_API_KEY,
+  api_secret: env.CLOUDINARY_API_SECRET
+});
 
-const hmac = p => crypto.createHmac('sha256', SECRET).update(p).digest('hex');
-const sign = () => { const p = String(Date.now() + 7 * 864e5); return p + '.' + hmac(p); };
-const auth = (req, res, next) => {
-  const [p, h] = (req.headers.authorization || '').replace('Bearer ', '').split('.');
-  if (p && h && +p > Date.now() && h === hmac(p)) return next();
-  res.status(401).json({ error: 'unauthorized' });
+let _pi = null;
+function pi() {
+  if (!_pi) {
+    const m = require("pi-backend");
+    const PiNetwork = m.default || m;
+    _pi = new PiNetwork(PI_KEY, env.PI_WALLET_SECRET);
+  }
+  return _pi;
+}
+
+/* ===== أدوات مساعدة ===== */
+
+/* استخراج رسالة خطأ آمنة (بدون طباعة كائن axios الذي يحتوي مفاتيح سرية) */
+function errInfo(e) {
+  const d = e && e.response && e.response.data;
+  if (d) return typeof d === "string" ? d : JSON.stringify(d);
+  return (e && e.message) || String(e);
+}
+function friendlyRefundError(msg) {
+  if (msg.includes("missing_scope") || msg.includes("wallet_address"))
+    return "المستخدم لم يمنح صلاحية wallet_address. يجب أن يفتح التطبيق ويسجّل الدخول من جديد ويوافق على الصلاحية، ثم أعد الاسترجاع.";
+  if (msg.includes("insufficient") || msg.includes("balance"))
+    return "رصيد محفظة التطبيق غير كافٍ (تذكّر احتياطي الحساب ~1 Pi). اشحن المحفظة ثم أعد المحاولة.";
+  if (msg.includes("ongoing_payment"))
+    return "توجد دفعة معلّقة لهذا المستخدم. أعد المحاولة بعد قليل.";
+  return "فشل الاسترجاع: " + msg.slice(0, 300);
+}
+
+const rl = new Map();
+function limited(key, max, ms) {
+  const now = Date.now();
+  const e = rl.get(key) || { c: 0, s: now };
+  if (now - e.s > ms) { e.c = 0; e.s = now; }
+  e.c++; rl.set(key, e);
+  return e.c > max;
+}
+setInterval(() => { const n = Date.now(); for (const [k, v] of rl) if (n - v.s > 3600000) rl.delete(k); }, 600000).unref();
+
+const clean = (v, max) => String(v ?? "").replace(/[\u0000-\u001F]/g, " ").trim().slice(0, max);
+const isImg = u => typeof u === "string" && u.startsWith("https://res.cloudinary.com/");
+const wrap = fn => async (req, res) => {
+  try { await fn(req, res); }
+  catch (e) {
+    console.error("ERROR", req.method, req.path, errInfo(e)); // لا نطبع e كاملاً أبداً
+    if (!res.headersSent) res.status(500).json({ error: errInfo(e).slice(0, 400) });
+  }
 };
-const wrap = fn => (req, res) => fn(req, res).catch(e => { console.error(e); res.status(500).json({ error: 'server' }); });
 
-/* =====================================================================
-   DAILY SUMMARIES  (one small document per day, kept in memory too)
-   -> the admin panel and the statistics never have to read all orders
-   ===================================================================== */
-// ---- DAILY-START
-const emptyD = () => ({ orders: 0, revenue: 0, pending: 0, shipped: 0, delivered: 0, cancelled: 0, unreviewed: 0, w: {}, t: {} });
-const SAFE = { '.': '․', '/': '∕', '[': '［', ']': '］', '*': '＊', '`': 'ˋ', '~': '～' };
-const sk = s => String(s || '-').replace(/[.\/\[\]*`~]/g, c => SAFE[c]).slice(0, 80) || '-';
-// what one order adds to its day
-const contrib = o => {
-  const c = emptyD(), live = o.status !== 'cancelled';
-  c.orders = 1;
-  if (typeof c[o.status] === 'number') c[o.status] = 1;
-  c.unreviewed = (!o.reviewed && live) ? 1 : 0;
-  if (live) {
-    c.revenue = typeof o.subtotal === 'number' ? o.subtotal : (o.total || 0) - (o.fee || 0); // products only, no delivery fee
-    c.w[sk(o.wilaya)] = 1;
-    (o.items || []).forEach(i => { const k = sk(i.name); c.t[k] = (c.t[k] || 0) + (i.qty || 0); });
-  }
-  return c;
-};
-const addD = (a, b, s) => {
-  for (const k in b) {
-    const v = b[k];
-    if (v && typeof v === 'object') { a[k] = a[k] || {}; addD(a[k], v, s); }
-    else a[k] = (a[k] || 0) + s * v;
-  }
-  return a;
-};
-const toInc = o => {
-  const out = {};
-  for (const k in o) {
-    const v = o[k];
-    if (typeof v === 'number') { if (v) out[k] = admin.firestore.FieldValue.increment(v); }
-    else if (v && typeof v === 'object') { const c = toInc(v); if (Object.keys(c).length) out[k] = c; }
-  }
-  return out;
-};
-// ---- DAILY-END
-
-let mirror = {};   // day -> summary (memory copy)
-let pend = {};     // day -> changes not yet written to Firestore
-let dTimer = null;
-async function flushDaily() {
-  const p = pend; pend = {};
-  for (const day in p) {
-    const payload = toInc(p[day]);
-    if (!Object.keys(payload).length) continue;
-    try { await db.collection('daily').doc(day).set(payload, { merge: true }); }
-    catch (e) { console.error('daily flush failed:', e.message); addD(pend[day] = pend[day] || emptyD(), p[day], 1); schedFlush(); }
-  }
+async function auth(req, res) {
+  const { accessToken, userUid } = req.body || {};
+  if (!accessToken || !userUid) { res.status(400).json({ error: "Missing data" }); return null; }
+  if (limited("a_" + userUid, 90, 60000)) { res.status(429).json({ error: "Too many requests" }); return null; }
+  const r = await fetch(PI_API + "/me", { headers: { Authorization: "Bearer " + accessToken } });
+  if (!r.ok) { res.status(401).json({ error: "Invalid token" }); return null; }
+  const u = await r.json();
+  if (u.uid !== userUid) { res.status(403).json({ error: "User mismatch" }); return null; }
+  u.isAdmin = ADMINS.includes((u.username || "").toLowerCase());
+  return u;
 }
-function schedFlush() { if (!dTimer) dTimer = setTimeout(() => { dTimer = null; flushDaily(); }, 2000); }
-function bump(day, diff) {
-  addD(mirror[day] = mirror[day] || emptyD(), diff, 1);
-  addD(pend[day] = pend[day] || emptyD(), diff, 1);
-  schedFlush();
-}
-async function loadDaily() {
-  const s = await db.collection('daily').get(), m = {};
-  s.forEach(d => { m[d.id] = Object.assign(emptyD(), d.data()); });
-  mirror = m;
-}
-// Rebuild every summary from the real orders (runs once automatically on first start, or from the admin button)
-async function rebuildDaily() {
-  const agg = {}; let last = null, n = 0;
-  for (;;) {
-    let q = db.collection('orders').orderBy('createdAt').limit(500);
-    if (last) q = q.startAfter(last);
-    const s = await q.get();
-    if (s.empty) break;
-    s.forEach(d => { const o = d.data(); addD(agg[dayOf(o.createdAt)] = agg[dayOf(o.createdAt)] || emptyD(), contrib(o), 1); n++; });
-    last = s.docs[s.docs.length - 1];
-    if (s.size < 500) break;
-  }
-  let batch = db.batch(), c = 0;
-  const commit = async () => { if (c) { await batch.commit(); batch = db.batch(); c = 0; } };
-  const old = await db.collection('daily').get();
-  for (const d of old.docs) { if (!agg[d.id]) { batch.delete(d.ref); if (++c >= 400) await commit(); } }
-  for (const day in agg) { batch.set(db.collection('daily').doc(day), agg[day]); if (++c >= 400) await commit(); }
-  await commit();
-  mirror = agg; pend = {};
-  return n;
+async function adminOnly(req, res) {
+  const u = await auth(req, res);
+  if (!u) return null;
+  if (!u.isAdmin) { res.status(403).json({ error: "Admins only" }); return null; }
+  return u;
 }
 
-/* visits: counted in memory, written to Firestore every 30 s */
-let visitsM = {}, visitBuf = {};
-async function flushVisits() {
-  const b = visitBuf; visitBuf = {};
-  for (const day in b) {
-    try { await db.collection('visits').doc(day).set({ count: admin.firestore.FieldValue.increment(b[day]) }, { merge: true }); }
-    catch (e) { console.error('visit flush failed:', e.message); visitBuf[day] = (visitBuf[day] || 0) + b[day]; }
-  }
-}
-async function loadVisits() {
-  const s = await db.collection('visits').get(), m = {};
-  s.forEach(d => { m[d.id] = d.data().count || 0; });
-  visitsM = m;
-}
-
-/* =====================================================================
-   PRODUCTS CACHE (so 100,000 visitors do NOT mean 100,000 database reads)
-   ===================================================================== */
-let PC = null, PC_LOADING = null;
-const PAGES = new Map();
-const invalidate = () => { PC = null; PAGES.clear(); };
-function getProducts() {
-  if (PC && Date.now() - PC.at < 6 * 3600e3) return Promise.resolve(PC);
-  if (!PC_LOADING) {
-    PC_LOADING = db.collection('products').orderBy('createdAt', 'desc').get().then(s => {
-      const list = s.docs.map(d => ({ id: d.id, ...d.data() })), json = JSON.stringify(list);
-      PC = { list, map: new Map(list.map(p => [p.id, p])), json, gz: zlib.gzipSync(json),
-        etag: '"' + crypto.createHash('md5').update(json).digest('hex') + '"', at: Date.now() };
-      return PC;
-    }).finally(() => { PC_LOADING = null; });
-  }
-  return PC_LOADING;
-}
+const pubShop = (id, d) => ({ id, name: d.name, country: d.country, region: d.region, address: d.address, phone: d.phone, hours: d.hours || "", description: d.description || "", image: d.image || "" });
+const pubProd = (id, d) => ({ id, name: d.name, brand: d.brand || "", size: d.size || "", price: d.price, currency: d.currency || "", description: d.description || "", image: d.image || "", createdAt: d.createdAt || 0 });
 
 const app = express();
-app.use(express.json({ limit: '100kb' }));
-app.set('trust proxy', 1);
-app.disable('x-powered-by');
+app.disable("x-powered-by");
+
+/* ===== رؤوس أمان أساسية ===== */
 app.use((req, res, next) => {
-  res.set({
-    'X-Content-Type-Options': 'nosniff',
-    'X-Frame-Options': 'DENY',
-    'Referrer-Policy': 'same-origin',
-    'Strict-Transport-Security': 'max-age=15552000',
-    'Content-Security-Policy': "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https://res.cloudinary.com; connect-src 'self'; frame-ancestors 'none'"
-  });
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("Referrer-Policy", "no-referrer");
   next();
 });
 
-// Only index.html is public. server.js and package.json are NOT exposed.
-const INDEX = fs.readFileSync(path.join(__dirname, 'index.html'), 'utf8'), INDEX_GZ = zlib.gzipSync(INDEX);
-function sendHTML(req, res, html, gz) {
-  res.set({ 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'public, max-age=60', 'Vary': 'Accept-Encoding' });
-  if (gz && acceptsGzip(req)) { res.set('Content-Encoding', 'gzip'); return res.send(gz); }
-  res.send(html);
-}
-app.get('/', (req, res) => sendHTML(req, res, INDEX, INDEX_GZ));
-
-// Each product has its own shareable link: /p/<id>  (with preview for Facebook / WhatsApp)
-const attr = s => String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
-app.get('/p/:id', async (req, res) => {
-  const key = req.params.id + '|' + req.protocol + '|' + req.get('host');
-  let pg = PAGES.get(key);
-  if (!pg) {
-    let html = INDEX, found = false;
-    try {
-      const p = (await getProducts()).map.get(req.params.id);
-      if (p) {
-        found = true;
-        const url = `${req.protocol}://${req.get('host')}/p/${req.params.id}`;
-        const desc = p.description || `${p.price} DA - ABDmoteurs`, og = (p.images && p.images[0]) || p.image;
-        html = html.replace('<title>ABDmoteurs</title>', `<title>${attr(p.name)} | ABDmoteurs</title>`).replace('<!--OG-->',
-          `<meta property="og:type" content="product"><meta property="og:site_name" content="ABDmoteurs"><meta property="og:title" content="${attr(p.name)}"><meta property="og:description" content="${attr(desc)}"><meta property="og:url" content="${attr(url)}">` +
-          (og ? `<meta property="og:image" content="${attr(og)}"><meta name="twitter:card" content="summary_large_image">` : ''));
-      }
-    } catch (e) { console.error(e); }
-    if (!found) return sendHTML(req, res, INDEX, INDEX_GZ);
-    pg = { html, gz: zlib.gzipSync(html) };
-    if (PAGES.size >= 200) PAGES.clear();
-    PAGES.set(key, pg);
+/* ===== CORS: يسمح لواجهة GitHub Pages بالاتصال بهذا السيرفر ===== */
+app.use((req, res, next) => {
+  const o = req.headers.origin;
+  if (o && ORIGINS.includes(o)) {
+    res.setHeader("Access-Control-Allow-Origin", o);
+    res.setHeader("Vary", "Origin");
+    res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+    res.setHeader("Access-Control-Max-Age", "86400");
   }
-  sendHTML(req, res, pg.html, pg.gz);
+  if (req.method === "OPTIONS") return res.sendStatus(204);
+  next();
 });
 
-const fails = new Map(); // simple brute-force protection: 5 wrong tries = 15 min block
-app.post('/api/login', (req, res) => {
-  const f = fails.get(req.ip) || { n: 0, t: Date.now() };
-  if (Date.now() - f.t > 15 * 60e3) { f.n = 0; f.t = Date.now(); }
-  if (f.n >= 5) return res.status(429).json({ error: 'too many attempts' });
-  const a = Buffer.from(String(req.body.password || '')), b = Buffer.from(process.env.ADMIN_PASSWORD || '');
-  if (b.length > 0 && a.length === b.length && crypto.timingSafeEqual(a, b)) { fails.delete(req.ip); return res.json({ token: sign() }); }
-  f.n++; fails.set(req.ip, f);
-  res.status(401).json({ error: 'bad password' });
-});
+app.use(express.json({ limit: "6mb" }));
 
-app.get('/api/products', wrap(async (req, res) => {
-  const c = await getProducts();
-  res.set({ 'Content-Type': 'application/json; charset=utf-8', 'ETag': c.etag, 'Cache-Control': 'no-cache', 'Vary': 'Accept-Encoding' });
-  if (req.headers['if-none-match'] === c.etag) return res.status(304).end();
-  if (acceptsGzip(req)) { res.set('Content-Encoding', 'gzip'); return res.send(c.gz); }
-  res.send(c.json);
-}));
+/* ===== عام ===== */
+app.get("/", (_, res) => res.send("Parfum API is running"));
+app.get("/health", (_, res) => res.json({ ok: true, app: "Parfum" }));
 
-const uploadImg = buf => new Promise((ok, no) =>
-  cloudinary.uploader.upload_stream({ folder: 'abdmoteur/products', transformation: [{ width: 1600, height: 1600, crop: 'limit', quality: 80 }] }, (e, r) => (e ? no(e) : ok(r.secure_url))).end(buf));
-const parseCompat = raw => {
-  let c = []; try { c = JSON.parse(raw || '[]'); } catch {}
-  return (Array.isArray(c) ? c : []).slice(0, 40)
-    .map(x => ({ brand: clean(x && x.brand, 30), model: clean(x && x.model, 40) })).filter(x => x.brand);
-};
-
-app.post('/api/products', auth, upload.array('images', 6), wrap(async (req, res) => {
-  const { name, price, category, description } = req.body;
-  if (!clean(name, 100) || !(+price > 0)) return res.status(400).json({ error: 'invalid' });
-  const compat = parseCompat(req.body.compat), universal = req.body.universal === '1';
-  if (!universal && !compat.length) return res.status(400).json({ error: 'compat required' });
-  const images = await Promise.all((req.files || []).slice(0, 6).map(f => uploadImg(f.buffer))), image = images[0] || '';
-  const doc = { name: clean(name, 100), price: +price, category: clean(category, 40), description: clean(description, 600),
-    compat, universal, available: req.body.available !== '0', image, images, createdAt: Date.now() };
-  const ref = await db.collection('products').add(doc);
-  invalidate();
-  res.json({ id: ref.id, ...doc });
-}));
-
-// Edit a product (full edit from the form, or just {available:true/false} from the quick toggle)
-app.patch('/api/products/:id', auth, upload.array('images', 6), wrap(async (req, res) => {
-  const b = req.body, upd = {};
-  if (b.name !== undefined) { if (!clean(b.name, 100)) return res.status(400).json({ error: 'invalid' }); upd.name = clean(b.name, 100); }
-  if (b.price !== undefined) { if (!(+b.price > 0)) return res.status(400).json({ error: 'invalid' }); upd.price = +b.price; }
-  if (b.category !== undefined) upd.category = clean(b.category, 40);
-  if (b.description !== undefined) upd.description = clean(b.description, 600);
-  if (b.available !== undefined) upd.available = b.available === true || b.available === '1' || b.available === 'true';
-  if (b.compat !== undefined) {
-    const compat = parseCompat(b.compat), universal = b.universal === '1';
-    if (!universal && !compat.length) return res.status(400).json({ error: 'compat required' });
-    upd.compat = compat; upd.universal = universal;
-  }
-  const ref = db.collection('products').doc(req.params.id);
-  // Photos: 'keep' = existing photo URLs to keep (in order), new files are appended. Max 6 in total.
-  if (b.keep !== undefined || (req.files && req.files.length)) {
-    const snap = await ref.get();
-    if (!snap.exists) return res.status(404).json({ error: 'not found' });
-    const o = snap.data(), oldImgs = o.images && o.images.length ? o.images : (o.image ? [o.image] : []);
-    let keep = oldImgs;
-    if (b.keep !== undefined) {
-      let k = []; try { k = JSON.parse(b.keep); } catch {}
-      keep = [...new Set(Array.isArray(k) ? k : [])].filter(u => oldImgs.includes(u));
-    }
-    const files = (req.files || []).slice(0, Math.max(0, 6 - keep.length));
-    const added = await Promise.all(files.map(f => uploadImg(f.buffer)));
-    upd.images = [...keep, ...added]; upd.image = upd.images[0] || '';
-  }
-  if (!Object.keys(upd).length) return res.status(400).json({ error: 'invalid' });
-  await ref.update(upd);
-  invalidate();
-  res.json({ ok: true });
-}));
-
-app.delete('/api/products/:id', auth, wrap(async (req, res) => {
-  await db.collection('products').doc(req.params.id).delete();
-  invalidate();
-  res.json({ ok: true });
-}));
-
-/* ---------------------------- ORDERS ---------------------------- */
-// الحد: 30 طلب في اليوم لكل رقم هاتف (يتجدد كل يوم حسب توقيت الجزائر). لا يوجد أي حد على الـ IP.
-const PHONE_DAILY_MAX = 30;  // max orders per phone number per day   <- change this number if you want
-const phoneDay = new Map();  // phone -> {day, n}
-const recent = new Map();    // phone + basket -> {t, id}   (stops double-click duplicates)
-// "+213 555 12 34 56", "0555123456" and "00213555123456" are the same phone
-const normPhone = p => { let d = String(p).replace(/\D/g, '').replace(/^00/, ''); if (d.startsWith('213')) d = '0' + d.slice(3); return d; };
-app.post('/api/orders', wrap(async (req, res) => {
-  const { name, phone, wilaya, address, delivery, items, car } = req.body;
-  if (!name || !/^[0-9+\s]{9,15}$/.test(phone || '') || !wilaya || !FEES[delivery] || !Array.isArray(items) || !items.length)
-    return res.status(400).json({ error: 'invalid' });
-  const now = Date.now(), today = dayOf(now);
-  const byId = (await getProducts()).map;
-  const lines = []; let subtotal = 0;
-  for (const it of items.slice(0, 50)) {
-    const p = byId.get(String(it.id));
-    const qty = Math.min(Math.max(parseInt(it.qty) || 0, 1), 99);
-    if (!p) continue;
-    if (p.available === false) return res.status(400).json({ error: 'unavailable', name: p.name });
-    subtotal += p.price * qty;
-    // full copy of the product as it was when ordered, so the admin knows exactly what to ship
-    lines.push({ id: p.id, name: p.name, price: p.price, qty, category: p.category || '', universal: !!p.universal,
-      compat: (p.compat || []).slice(0, 40), description: clean(p.description, 600), image: (p.images && p.images[0]) || p.image || '' });
-  }
-  if (!lines.length) return res.status(400).json({ error: 'empty' });
-  const ph = clean(phone, 15), key = normPhone(ph), sig = key + '|' + lines.map(l => l.id + 'x' + l.qty).sort().join(',');
-  const dup = recent.get(sig);
-  if (dup && now - dup.t < 120e3) return res.json({ id: dup.id });
-  let pr = phoneDay.get(key);
-  if (!pr || pr.day !== today) pr = { day: today, n: 0 };
-  if (pr.n >= PHONE_DAILY_MAX) return res.status(429).json({ error: 'phone limit' });
-  pr.n++; phoneDay.set(key, pr);
-  const order = { name: clean(name, 80), phone: ph, wilaya: clean(wilaya, 40), address: clean(address, 160), car: clean(car, 80), delivery,
-    items: lines, subtotal, fee: FEES[delivery], total: subtotal + FEES[delivery], status: 'pending', reviewed: false, createdAt: stamp() };
-  const ref = db.collection('orders').doc();
-  await ref.set(order);
-  recent.set(sig, { t: now, id: ref.id });
-  bump(dayOf(order.createdAt), contrib(order));
-  res.json({ id: ref.id });
-}));
-
-// admin: one line per day (counts only) - served from memory, costs no database reads
-app.get('/api/orders/days', auth, wrap(async (_, res) => {
-  res.json({ days: Object.keys(mirror).filter(d => mirror[d].orders > 0).sort().reverse()
-    .map(d => ({ day: d, orders: mirror[d].orders, unreviewed: Math.max(0, mirror[d].unreviewed), revenue: mirror[d].revenue })) });
-}));
-
-// admin: the orders of ONE day, 100 at a time (newest first)
-app.get('/api/orders', auth, wrap(async (req, res) => {
-  const day = String(req.query.day || '');
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(day)) return res.status(400).json({ error: 'invalid' });
-  const start = dayStart(day), end = start + 864e5, before = +req.query.before || end, LIM = 100;
-  const s = await db.collection('orders').where('createdAt', '>=', start).where('createdAt', '<', Math.min(before, end))
-    .orderBy('createdAt', 'desc').limit(LIM + 1).get();
-  res.json({ orders: s.docs.slice(0, LIM).map(d => ({ id: d.id, ...d.data() })), more: s.docs.length > LIM });
-}));
-
-app.patch('/api/orders/:id', auth, wrap(async (req, res) => {
-  const upd = {};
-  if (req.body.status !== undefined) {
-    if (!['pending', 'shipped', 'delivered', 'cancelled'].includes(req.body.status)) return res.status(400).json({ error: 'invalid' });
-    upd.status = req.body.status;
-  }
-  if (req.body.reviewed !== undefined) upd.reviewed = req.body.reviewed === true;
-  if (!Object.keys(upd).length) return res.status(400).json({ error: 'invalid' });
-  const ref = db.collection('orders').doc(req.params.id);
-  const out = await db.runTransaction(async tx => {
-    const s = await tx.get(ref);
-    if (!s.exists) return null;
-    const old = s.data(), d = emptyD();
-    tx.update(ref, upd);
-    addD(d, contrib({ ...old, ...upd }), 1); addD(d, contrib(old), -1);
-    return { day: dayOf(old.createdAt), d };
+app.get("/api/config", (_, res) => {
+  res.json({
+    shopFee: SHOP_FEE, productFee: PRODUCT_FEE,
+    refundDeduct: REFUND_DEDUCT,
+    sandbox: env.PI_SANDBOX === "true"
   });
-  if (!out) return res.status(404).json({ error: 'not found' });
-  bump(out.day, out.d);
-  res.json({ ok: true });
-}));
-
-app.post('/api/rebuild', auth, wrap(async (_, res) => {
-  const n = await rebuildDaily();
-  res.json({ ok: true, orders: n, days: Object.keys(mirror).length });
-}));
-
-app.post('/api/visit', (req, res) => {
-  const day = dayOf(Date.now());
-  visitsM[day] = (visitsM[day] || 0) + 1; visitBuf[day] = (visitBuf[day] || 0) + 1;
-  res.json({ ok: true });
 });
 
-app.get('/api/stats', auth, wrap(async (_, res) => {
-  const ps = (await getProducts()).list;
-  const st = { outofstock: ps.filter(p => p.available === false).length, orders: 0, revenue: 0, pending: 0, delivered: 0, cancelled: 0, shipped: 0,
-    unreviewed: 0, products: ps.length, visits: 0 };
-  const w = {}, t = {}, byDay = {};
-  for (const day of Object.keys(mirror).sort()) {
-    const m = mirror[day];
-    ['orders', 'revenue', 'pending', 'delivered', 'cancelled', 'shipped'].forEach(k => { st[k] += m[k] || 0; });
-    st.unreviewed += Math.max(0, m.unreviewed || 0);
-    if (m.revenue > 0) byDay[day] = m.revenue;
-    for (const k in m.w) w[k] = (w[k] || 0) + m.w[k];
-    for (const k in m.t) t[k] = (t[k] || 0) + m.t[k];
-  }
-  const vDays = Object.keys(visitsM).sort();
-  vDays.forEach(d => { st.visits += visitsM[d]; });
-  const top = o => Object.fromEntries(Object.entries(o).filter(e => e[1] > 0).sort((a, b) => b[1] - a[1]).slice(0, 8));
-  const last = (o, keys) => Object.fromEntries(keys.slice(-14).map(k => [k, o[k]]));
-  res.json({ ...st, top: top(t), byWilaya: top(w), byDay: last(byDay, Object.keys(byDay).sort()), visitsByDay: last(visitsM, vDays) });
+/* المحلات المنشورة مع منتجاتها المنشورة */
+app.get("/api/shops", wrap(async (_, res) => {
+  const [s, p] = await Promise.all([
+    db.collection("shops").where("status", "==", "live").get(),
+    db.collection("products").where("status", "==", "live").get()
+  ]);
+  const prods = {};
+  p.forEach(d => { const x = d.data(); (prods[x.shopId] = prods[x.shopId] || []).push(pubProd(d.id, x)); });
+  const shops = s.docs.map(d => {
+    const list = (prods[d.id] || []).sort((a, b) => b.createdAt - a.createdAt);
+    return { ...pubShop(d.id, d.data()), products: list };
+  });
+  res.json({ shops });
 }));
 
-// Upload errors (too many files, file too big...) -> clean JSON instead of a crash page
-app.use((err, req, res, next) => { console.error(err.message); res.status(400).json({ error: 'upload' }); });
+/* ===== حساب المستخدم ===== */
+app.post("/api/me", wrap(async (req, res) => {
+  const u = await auth(req, res); if (!u) return;
+  const [sd, ps] = await Promise.all([
+    db.collection("shops").doc(u.uid).get(),
+    db.collection("products").where("ownerUid", "==", u.uid).get()
+  ]);
+  const products = ps.docs.map(d => ({ id: d.id, ...d.data() })).sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+  res.json({
+    user: { uid: u.uid, username: u.username }, isAdmin: u.isAdmin,
+    hasWallet: !!u.wallet_address,
+    shop: sd.exists ? { id: sd.id, ...sd.data() } : null,
+    products
+  });
+}));
 
-setInterval(() => {
-  const n = Date.now();
-  for (const [k, v] of fails) if (n - v.t > 15 * 60e3) fails.delete(k);
-  for (const [k, v] of phoneDay) if (v.day !== dayOf(n)) phoneDay.delete(k);
-  for (const [k, v] of recent) if (n - v.t > 120e3) recent.delete(k);
-}, 10 * 60e3).unref();
-setInterval(flushVisits, 30e3).unref();
+app.post("/api/upload", wrap(async (req, res) => {
+  const u = await auth(req, res); if (!u) return;
+  if (limited("up_" + u.uid, 30, 3600000)) return res.status(429).json({ error: "Too many uploads" });
+  const f = req.body.file || "";
+  const m = f.match(/^data:image\/(jpeg|png|webp);base64,(.+)$/);
+  if (!m) return res.status(400).json({ error: "Invalid image" });
+  if (Buffer.byteLength(m[2], "base64") > 3 * 1024 * 1024) return res.status(400).json({ error: "Image over 3MB" });
+  const r = await cloudinary.v2.uploader.upload(f, { folder: "parfum/" + u.uid, transformation: [{ width: 1200, crop: "limit" }] });
+  res.json({ url: r.secure_url });
+}));
 
-// save pending counters when Render restarts / stops the server
-process.on('SIGTERM', async () => { try { await flushDaily(); await flushVisits(); } catch {} process.exit(0); });
+/* ===== المحل: حفظ البيانات (الحالة الأولى unpaid حتى يتم دفع 5 Pi) ===== */
+app.post("/api/shop/save", wrap(async (req, res) => {
+  const u = await auth(req, res); if (!u) return;
+  const b = req.body;
+  const data = {
+    name: clean(b.name, 80), country: clean(b.country, 2).toUpperCase(), region: clean(b.region, 60),
+    address: clean(b.address, 160), phone: clean(b.phone, 30), hours: clean(b.hours, 60),
+    description: clean(b.description, 500), image: isImg(b.image) ? b.image : ""
+  };
+  if (!data.name || !/^[A-Z]{2}$/.test(data.country) || !data.region || !data.address || !data.phone || !data.image)
+    return res.status(400).json({ error: "Please complete all required fields (including the shop photo)" });
+  const ref = db.collection("shops").doc(u.uid);
+  const snap = await ref.get();
+  if (snap.exists) {
+    const old = snap.data();
+    if (old.status === "removed") return res.status(403).json({ error: "This shop was removed by the administrator" });
+    const upd = { ...data, ownerUsername: u.username, updatedAt: Date.now() };
+    if (old.status === "refunded") { upd.status = "unpaid"; upd.reviewMessage = ""; }
+    await ref.update(upd);
+  } else {
+    await ref.set({
+      ...data, ownerUid: u.uid, ownerUsername: u.username, status: "unpaid",
+      feePaid: false, reviewMessage: "", createdAt: Date.now()
+    });
+  }
+  res.json({ success: true, id: u.uid });
+}));
 
-app.listen(process.env.PORT || 3000, () => console.log('ABDmoteurs running'));
+/* ===== المنتجات: حفظ (جديد = unpaid حتى يتم دفع 0.25 Pi) ===== */
+app.post("/api/product/save", wrap(async (req, res) => {
+  const u = await auth(req, res); if (!u) return;
+  const shop = await db.collection("shops").doc(u.uid).get();
+  if (!shop.exists || shop.data().status !== "live")
+    return res.status(400).json({ error: "Your shop must be open first" });
+  const b = req.body;
+  const price = Number(b.price);
+  const data = {
+    name: clean(b.name, 80), brand: clean(b.brand, 60), size: clean(b.size, 30),
+    price, currency: clean(b.currency, 6).toUpperCase(), description: clean(b.description, 400),
+    image: isImg(b.image) ? b.image : ""
+  };
+  if (!data.name || !(price > 0 && price < 1e9) || !data.currency || !data.image)
+    return res.status(400).json({ error: "Please complete all required fields (including the product photo)" });
+  if (b.id) {
+    const ref = db.collection("products").doc(String(b.id));
+    const s = await ref.get();
+    if (!s.exists || s.data().ownerUid !== u.uid) return res.status(403).json({ error: "Not your product" });
+    const old = s.data();
+    if (old.status === "removed") return res.status(403).json({ error: "This product was removed by the administrator" });
+    const upd = { ...data, updatedAt: Date.now() };
+    if (old.status === "refunded") { upd.status = "unpaid"; upd.reviewMessage = ""; }
+    await ref.update(upd);
+    return res.json({ success: true, id: ref.id });
+  }
+  const count = (await db.collection("products").where("ownerUid", "==", u.uid).get()).size;
+  if (count >= 200) return res.status(400).json({ error: "Product limit reached" });
+  const added = await db.collection("products").add({
+    ...data, shopId: u.uid, ownerUid: u.uid, status: "unpaid", feePaid: false,
+    reviewMessage: "", createdAt: Date.now()
+  });
+  res.json({ success: true, id: added.id });
+}));
 
-// start-up: load the summaries; on the very first start, build them from the existing orders
-(async () => {
-  try {
-    await Promise.all([loadDaily(), loadVisits()]);
-    if (!Object.keys(mirror).length) {
-      const any = await db.collection('orders').limit(1).get();
-      if (!any.empty) { const n = await rebuildDaily(); console.log('daily summaries built from', n, 'orders'); }
+app.post("/api/product/delete", wrap(async (req, res) => {
+  const u = await auth(req, res); if (!u) return;
+  const ref = db.collection("products").doc(String(req.body.id || ""));
+  const s = await ref.get();
+  if (!s.exists || s.data().ownerUid !== u.uid) return res.status(403).json({ error: "Not your product" });
+  await ref.delete();
+  res.json({ success: true });
+}));
+
+/* ===== الدفع (المستخدم إلى التطبيق) ===== */
+async function getPayment(id) {
+  const r = await fetch(`${PI_API}/payments/${encodeURIComponent(id)}`, { headers: { Authorization: `Key ${PI_KEY}` } });
+  if (!r.ok) throw new Error("Payment not found");
+  return r.json();
+}
+async function checkPayment(p) {
+  const { type, targetId } = p.metadata || {};
+  const col = type === "shop_fee" ? "shops" : type === "product_fee" ? "products" : null;
+  if (!col || !targetId) throw new Error("Bad payment data");
+  const ref = db.collection(col).doc(String(targetId));
+  const s = await ref.get();
+  if (!s.exists) throw new Error("Target not found");
+  const d = s.data();
+  if (d.ownerUid !== p.user_uid) throw new Error("Owner mismatch");
+  const fee = type === "shop_fee" ? SHOP_FEE : PRODUCT_FEE;
+  if (Math.abs(Number(p.amount) - fee) > 1e-7) throw new Error("Amount mismatch");
+  return { ref, d, type, targetId, fee };
+}
+
+app.post("/api/pay/approve", wrap(async (req, res) => {
+  const { paymentId } = req.body || {};
+  if (!paymentId) return res.status(400).json({ error: "Missing data" });
+  const pid = String(paymentId);
+  const p = await getPayment(pid);
+  const c = await checkPayment(p);
+  if (c.d.status !== "unpaid") throw new Error("Not awaiting payment");
+  const r = await fetch(`${PI_API}/payments/${encodeURIComponent(pid)}/approve`, { method: "POST", headers: { Authorization: `Key ${PI_KEY}` } });
+  if (!r.ok) throw new Error(await r.text());
+  res.json({ success: true });
+}));
+
+app.post("/api/pay/complete", wrap(async (req, res) => {
+  const { paymentId, txid } = req.body || {};
+  if (!paymentId) return res.status(400).json({ error: "Missing data" });
+  const pid = String(paymentId);
+  const done = await db.collection("payments").doc(pid).get();
+  if (done.exists) return res.json({ success: true });
+  const p = await getPayment(pid);
+  const c = await checkPayment(p);
+  const tx = (p.transaction && p.transaction.txid) || txid;
+  if (!tx) throw new Error("Missing txid");
+  if (!(p.status && p.status.developer_completed)) {
+    const r = await fetch(`${PI_API}/payments/${encodeURIComponent(pid)}/complete`, {
+      method: "POST", headers: { Authorization: `Key ${PI_KEY}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ txid: tx })
+    });
+    if (!r.ok) throw new Error(await r.text());
+  }
+  // إذا كان العنصر منشوراً مسبقاً (دفعة مكررة) نسجّلها فقط
+  const fresh = c.d.status === "unpaid";
+  const b = db.batch();
+  if (fresh) b.update(c.ref, { status: "live", feePaid: true, publishedAt: Date.now() });
+  b.set(db.collection("payments").doc(pid), {
+    userUid: p.user_uid, type: c.type, targetId: c.targetId, targetName: c.d.name,
+    amount: c.fee, txid: tx, paidAt: Date.now(),
+    // رسوم المنتجات غير قابلة للاسترجاع أبداً، أما رسوم المحل فتبدأ بـ none
+    refundStatus: c.type === "product_fee" ? "nonrefundable" : "none",
+    duplicate: !fresh
+  });
+  await b.commit();
+  res.json({ success: true });
+}));
+
+/* ===== الإدارة ===== */
+app.post("/api/admin/list", wrap(async (req, res) => {
+  const u = await adminOnly(req, res); if (!u) return;
+  const [s, p, y] = await Promise.all([
+    db.collection("shops").limit(300).get(),
+    db.collection("products").limit(500).get(),
+    db.collection("payments").orderBy("paidAt", "desc").limit(50).get()
+  ]);
+  const names = {};
+  const shops = s.docs.map(d => {
+    const x = d.data(); names[d.id] = x.name;
+    return { id: d.id, name: x.name, country: x.country, region: x.region, ownerUsername: x.ownerUsername, status: x.status, image: x.image || "", createdAt: x.createdAt || 0 };
+  }).sort((a, b) => b.createdAt - a.createdAt);
+  const products = p.docs.map(d => {
+    const x = d.data();
+    return { id: d.id, name: x.name, shopId: x.shopId, shopName: names[x.shopId] || "", price: x.price, currency: x.currency, status: x.status, image: x.image || "", createdAt: x.createdAt || 0 };
+  }).sort((a, b) => b.createdAt - a.createdAt);
+  const st = {};
+  shops.forEach(x => { st["shop_fee:" + x.id] = x.status; });
+  products.forEach(x => { st["product_fee:" + x.id] = x.status; });
+  res.json({
+    shops, products,
+    payments: y.docs.map(d => { const x = d.data(); return { id: d.id, ...x, targetStatus: st[x.type + ":" + x.targetId] || "missing" }; })
+  });
+}));
+
+/* ===== إحصائيات الأدمن ===== */
+let statsCache = { k: "", t: 0, d: null };
+app.post("/api/admin/stats", wrap(async (req, res) => {
+  const u = await adminOnly(req, res); if (!u) return;
+  const tz = Math.max(-840, Math.min(840, Math.round(Number(req.body.tz)) || 0)); // فرق التوقيت بالدقائق (من المتصفح)
+  const now = Date.now();
+  if (!req.body.force && statsCache.d && statsCache.k === String(tz) && now - statsCache.t < 15000) return res.json(statsCache.d);
+
+  const [s, p, y] = await Promise.all([
+    db.collection("shops").select("name", "status", "country", "createdAt", "ownerUid").get(),
+    db.collection("products").select("status", "shopId", "createdAt").get(),
+    db.collection("payments").select("type", "amount", "paidAt", "refundStatus", "refundAmount", "refundDeduction", "duplicate", "targetName").get()
+  ]);
+
+  const r = n => Number(Number(n || 0).toFixed(7));
+  const dk = ts => { const n = Number(ts); return n > 0 ? new Date(n - tz * 60000).toISOString().slice(0, 10) : ""; };
+  const today = dk(now);
+  const DAY = 86400000;
+
+  const days = [];
+  for (let i = 13; i >= 0; i--) days.push(dk(now - i * DAY));
+  const rev = {}, ns = {}, np = {};
+  days.forEach(d => { rev[d] = 0; ns[d] = 0; np[d] = 0; });
+
+  const z = () => ({ revenue: 0, shops: 0, products: 0 });
+  const per = { today: z(), d7: z(), d30: z(), all: z() };
+  const addTo = (ts, field, val) => {
+    const n = Number(ts) || 0;
+    per.all[field] += val;
+    if (n && now - n < 30 * DAY) per.d30[field] += val;
+    if (n && now - n < 7 * DAY) per.d7[field] += val;
+    if (n && dk(n) === today) per.today[field] += val;
+  };
+
+  const cnt = () => ({ total: 0, live: 0, unpaid: 0, removed: 0, refunded: 0 });
+  const sc = cnt(), pc = cnt();
+  const owners = new Set(), info = {}, byCountry = {}, perShop = {};
+
+  s.forEach(d => {
+    const x = d.data();
+    const st = ["live", "unpaid", "removed", "refunded"].includes(x.status) ? x.status : "unpaid";
+    sc.total++; sc[st]++;
+    if (x.ownerUid) owners.add(x.ownerUid);
+    info[d.id] = { name: x.name || "", country: x.country || "", live: x.status === "live" };
+    addTo(x.createdAt, "shops", 1);
+    const k = dk(x.createdAt); if (k in ns) ns[k]++;
+    if (x.status === "live") {
+      const c = x.country || "--";
+      (byCountry[c] = byCountry[c] || { shops: 0, products: 0 }).shops++;
     }
-  } catch (e) { console.error('start-up load failed:', e.message); }
-})();
+  });
+
+  p.forEach(d => {
+    const x = d.data();
+    const st = ["live", "unpaid", "removed", "refunded"].includes(x.status) ? x.status : "unpaid";
+    pc.total++; pc[st]++;
+    addTo(x.createdAt, "products", 1);
+    const k = dk(x.createdAt); if (k in np) np[k]++;
+    const sh = info[x.shopId];
+    if (x.status === "live" && sh && sh.live) {
+      perShop[x.shopId] = (perShop[x.shopId] || 0) + 1;
+      const c = sh.country || "--";
+      (byCountry[c] = byCountry[c] || { shops: 0, products: 0 }).products++;
+    }
+  });
+
+  const m = { shopFees: 0, productFees: 0, refunded: 0, kept: 0 };
+  const rs = { refunded: 0, failed: 0, stuck: 0, processing: 0 };
+  let dups = 0;
+  const recent = [];
+  y.forEach(d => {
+    const x = d.data();
+    const a = Number(x.amount) || 0;
+    if (x.type === "shop_fee") m.shopFees += a; else m.productFees += a;
+    if (x.duplicate) dups++;
+    addTo(x.paidAt, "revenue", a);
+    const k = dk(x.paidAt); if (k in rev) rev[k] += a;
+    if (x.type === "shop_fee") {
+      if (x.refundStatus === "refunded") { m.refunded += Number(x.refundAmount) || 0; m.kept += Number(x.refundDeduction) || 0; rs.refunded++; }
+      else if (["failed", "stuck", "processing"].includes(x.refundStatus)) rs[x.refundStatus]++;
+    }
+    recent.push({ name: x.targetName || "", type: x.type, amount: a, paidAt: Number(x.paidAt) || 0, refundStatus: x.refundStatus || "none" });
+  });
+  recent.sort((a, b) => b.paidAt - a.paidAt);
+
+  const countries = Object.entries(byCountry)
+    .map(([code, v]) => ({ code, shops: v.shops, products: v.products }))
+    .sort((a, b) => b.shops - a.shops || b.products - a.products).slice(0, 8);
+  const topShops = Object.entries(perShop)
+    .map(([id, n]) => ({ name: (info[id] && info[id].name) || "", country: (info[id] && info[id].country) || "", products: n }))
+    .sort((a, b) => b.products - a.products).slice(0, 5);
+
+  const collected = m.shopFees + m.productFees;
+  const fixPer = o => ({ revenue: r(o.revenue), shops: o.shops, products: o.products });
+  const out = {
+    at: now, days,
+    revDay: days.map(d => r(rev[d])), shopsDay: days.map(d => ns[d]), prodsDay: days.map(d => np[d]),
+    shops: sc, products: pc, owners: owners.size,
+    money: { shopFees: r(m.shopFees), productFees: r(m.productFees), collected: r(collected), refunded: r(m.refunded), kept: r(m.kept), net: r(collected - m.refunded) },
+    payments: { total: y.size, duplicates: dups, refunds: rs },
+    periods: { today: fixPer(per.today), d7: fixPer(per.d7), d30: fixPer(per.d30), all: fixPer(per.all) },
+    countries, topShops, recent: recent.slice(0, 8),
+    alerts: { failedRefunds: rs.failed, stuckRefunds: rs.stuck, processing: rs.processing, duplicates: dups, unpaidShops: sc.unpaid, unpaidProducts: pc.unpaid }
+  };
+  statsCache = { k: String(tz), t: now, d: out };
+  res.json(out);
+}));
+
+/* ===== الاسترجاع (التطبيق إلى المستخدم - A2U) =====
+   القاعدة: الاسترجاع متاح فقط لرسوم فتح المحل (shop_fee).
+   رسوم المنتجات (product_fee) غير قابلة للاسترجاع أبداً. */
+
+/* ينظّف دفعات A2U العالقة. إن وجد دفعة استرجاع لنفس الدفعة لها txid يُكملها ويعيدها (لمنع الاسترجاع المزدوج) */
+async function clearStuck(paymentId) {
+  let resumed = null;
+  let list = [];
+  try {
+    const raw = await pi().getIncompleteServerPayments();
+    // قد ترجع المكتبة مصفوفة أو كائناً يحتوي المصفوفة
+    if (Array.isArray(raw)) list = raw;
+    else if (raw && Array.isArray(raw.incomplete_server_payments)) list = raw.incomplete_server_payments;
+    else if (raw && Array.isArray(raw.data)) list = raw.data;
+    else list = [];
+  } catch (e) { console.error("getIncomplete:", errInfo(e)); return null; }
+  for (const p of list) {
+    const tx = p.transaction && p.transaction.txid;
+    const mine = p.metadata && String(p.metadata.paymentId) === String(paymentId);
+    try {
+      if (tx) {
+        await pi().completePayment(p.identifier, tx);
+        if (mine) resumed = { rid: p.identifier, txid: tx };
+      } else {
+        await pi().cancelPayment(p.identifier);
+      }
+    } catch (e) { console.error("clearStuck:", p.identifier, errInfo(e)); }
+  }
+  return resumed;
+}
+
+/* استرجاع دفعة رسوم محل. لا يُستدعى إلا بعد حذف المحل من قبل المطور */
+async function refundPayment(paymentId, reason, by) {
+  const pref = db.collection("payments").doc(String(paymentId));
+  // قفل لمنع الاسترجاع المزدوج
+  const info = await db.runTransaction(async t => {
+    const s = await t.get(pref);
+    if (!s.exists) throw new Error("Payment not found");
+    const d = s.data();
+    if (d.type !== "shop_fee") throw new Error("Product fees are non-refundable");
+    if (!["none", "failed", "stuck"].includes(d.refundStatus)) throw new Error("Already refunded or processing");
+    t.update(pref, { refundStatus: "processing" });
+    return d;
+  });
+  // المبلغ المسترجع = رسوم المحل المدفوعة ناقص خصم الشبكة (مثلاً 5 - 0.01 = 4.99)
+  const deduct = REFUND_DEDUCT;
+  const refundAmt = Number((Number(info.amount) - deduct).toFixed(7));
+  if (!(refundAmt > 0)) {
+    await pref.update({ refundStatus: "failed" }).catch(() => {});
+    throw new Error("Refund amount too small");
+  }
+  let rid = info.refundRid || null, txid = info.refundTxid || null;
+  try {
+    if (!rid) {
+      const resumed = await clearStuck(paymentId);
+      if (resumed) { rid = resumed.rid; txid = resumed.txid; }
+    }
+    if (!rid) {
+      rid = await pi().createPayment({
+        amount: refundAmt, memo: "Parfum refund",
+        metadata: { type: "refund", paymentId: String(paymentId) }, uid: info.userUid
+      });
+      await pref.update({ refundRid: rid });
+    }
+    if (!txid) {
+      txid = await pi().submitPayment(rid);
+      await pref.update({ refundTxid: txid });
+    }
+    await pi().completePayment(rid, txid);
+  } catch (e) {
+    const raw = errInfo(e);
+    console.error("REFUND ERROR:", paymentId, raw);
+    if (txid) {
+      // المال أُرسل لكن لم يكتمل التسجيل: لا ننشئ دفعة جديدة، نُكمل نفس الدفعة لاحقاً
+      await pref.update({ refundStatus: "stuck", refundRid: rid, refundTxid: txid, lastError: raw.slice(0, 500) }).catch(() => {});
+    } else {
+      if (rid) { try { await pi().cancelPayment(rid); } catch {} }
+      await pref.update({ refundStatus: "failed", refundRid: null, lastError: raw.slice(0, 500) }).catch(() => {});
+    }
+    throw new Error(friendlyRefundError(raw));
+  }
+  try {
+    await pref.update({
+      refundStatus: "refunded", refundTxid: txid, refundedAt: Date.now(),
+      refundAmount: refundAmt, refundDeduction: deduct,
+      refundReason: clean(reason, 200), refundedBy: by
+    });
+  } catch (e) { console.error("Refund sent but DB update failed:", paymentId, txid, errInfo(e)); }
+  return { txid, amount: refundAmt };
+}
+
+/* ===== الحذف النهائي (Firestore + Cloudinary) ===== */
+
+/* استخراج public_id من رابط Cloudinary، ولا نحذف إلا صور مجلد هذا المستخدم */
+function cloudId(url, ownerUid) {
+  try {
+    const u = String(url || "");
+    if (!u.startsWith("https://res.cloudinary.com/")) return null;
+    if (env.CLOUDINARY_CLOUD_NAME && !u.startsWith(`https://res.cloudinary.com/${env.CLOUDINARY_CLOUD_NAME}/`)) return null;
+    const i = u.indexOf("/upload/");
+    if (i < 0) return null;
+    let p = decodeURIComponent(u.slice(i + 8).split("?")[0]);
+    const j = p.indexOf("parfum/");
+    if (j < 0) return null;
+    p = p.slice(j).replace(/\.[a-z0-9]+$/i, "");
+    if (!ownerUid || !p.startsWith("parfum/" + ownerUid + "/")) return null;
+    return p;
+  } catch { return null; }
+}
+async function destroyImage(url, ownerUid) {
+  const id = cloudId(url, ownerUid);
+  if (!id) return;
+  try { await cloudinary.v2.uploader.destroy(id, { invalidate: true }); }
+  catch (e) { console.error("cloudinary destroy:", id, errInfo(e)); }
+}
+async function purgeDoc(ref, data) {
+  await destroyImage(data && data.image, data && data.ownerUid);
+  await ref.delete();
+}
+
+/* هل استُرجعت كل دفعات رسوم هذا العنصر؟ (أو لا توجد دفعات أصلاً) */
+async function canPurge(feeType, id) {
+  const ps = await db.collection("payments").where("targetId", "==", String(id)).get();
+  return ps.docs.every(d => { const x = d.data(); return x.type !== feeType || x.refundStatus === "refunded"; });
+}
+
+/* يحذف العنصر نهائياً.
+   - المنتج: يُحذف مباشرة (رسومه غير قابلة للاسترجاع).
+   - المحل: يُحذف فقط بعد استرجاع رسوم فتحه بالكامل، ويُحذف معه كل منتجاته بدون أي استرجاع لرسومها. */
+async function finalizeRemoval(type, id, ref, data) {
+  if (type === "shop") {
+    if (!(await canPurge("shop_fee", id))) return false;
+    const pq = await db.collection("products").where("shopId", "==", String(id)).get();
+    for (const pd of pq.docs) await purgeDoc(pd.ref, pd.data());
+  }
+  await purgeDoc(ref, data);
+  return true;
+}
+
+/* حذف محل/منتج أو استعادته.
+   حذف المحل: يسترجع رسوم فتح المحل فقط ثم يمحى نهائياً مع منتجاته. حذف المنتج: بدون أي استرجاع. */
+app.post("/api/admin/moderate", wrap(async (req, res) => {
+  const u = await adminOnly(req, res); if (!u) return;
+  const { type, id, action, message } = req.body;
+  if (!["shop", "product"].includes(type) || !["remove", "restore"].includes(action) || !id)
+    return res.status(400).json({ error: "Bad request" });
+  const ref = db.collection(type === "shop" ? "shops" : "products").doc(String(id));
+  const s = await ref.get();
+  if (!s.exists) return res.status(404).json({ error: "Not found" });
+
+  if (action === "restore") {
+    const d = s.data();
+    if (d.status !== "removed") return res.status(400).json({ error: "Not removed" });
+    await ref.update({ status: d.feePaid ? "live" : "unpaid", reviewMessage: "", reviewedAt: Date.now() });
+    return res.json({ success: true });
+  }
+
+  const msg = clean(message, 300);
+  if (!msg) return res.status(400).json({ error: "Reason required" });
+  await ref.update({ status: "removed", reviewMessage: msg, reviewedAt: Date.now() });
+
+  let refunded = 0, failed = 0, total = 0, lastErr = "";
+  if (type === "shop") {
+    // استرجاع رسوم فتح المحل فقط
+    const ps = await db.collection("payments").where("targetId", "==", String(id)).get();
+    for (const d of ps.docs) {
+      const x = d.data();
+      if (x.type !== "shop_fee" || !["none", "failed", "stuck"].includes(x.refundStatus)) continue;
+      try { const r = await refundPayment(d.id, msg, u.username); refunded++; total += r.amount; }
+      catch (e) { failed++; lastErr = e.message; console.error("Refund failed:", d.id, e.message); }
+    }
+  }
+  const deleted = await finalizeRemoval(type, String(id), ref, s.data());
+  if (!deleted && refunded) await ref.update({ feePaid: false });
+  res.json({ success: true, refunded, failed, amount: Number(total.toFixed(7)), error: lastErr, deleted });
+}));
+
+/* إعادة محاولة استرجاع فاشل: مسموح فقط لرسوم المحل، وفقط إذا كان المحل محذوفاً */
+app.post("/api/admin/refund", wrap(async (req, res) => {
+  const u = await adminOnly(req, res); if (!u) return;
+  const { paymentId, reason } = req.body;
+  if (!paymentId) return res.status(400).json({ error: "Missing data" });
+  const ps = await db.collection("payments").doc(String(paymentId)).get();
+  if (!ps.exists) return res.status(404).json({ error: "Payment not found" });
+  const x = ps.data();
+  if (x.type !== "shop_fee") return res.status(400).json({ error: "Product fees are non-refundable" });
+  const tg = await db.collection("shops").doc(String(x.targetId)).get();
+  if (!tg.exists || tg.data().status !== "removed")
+    return res.status(400).json({ error: "Remove the shop first. Refunds happen only after removal." });
+  const r = await refundPayment(paymentId, reason || tg.data().reviewMessage, u.username);
+  const deleted = await finalizeRemoval("shop", String(x.targetId), tg.ref, tg.data());
+  if (!deleted) await tg.ref.update({ feePaid: false });
+  res.json({ success: true, txid: r.txid, amount: r.amount, deleted });
+}));
+
+/* ===== الواجهة (اختياري: إذا وُجد مجلد public) ===== */
+app.use(express.static(path.join(__dirname, "public")));
+
+const PORT = env.PORT || 3000;
+app.listen(PORT, () => console.log("Parfum running on port", PORT));
