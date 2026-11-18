@@ -655,10 +655,11 @@ async function canPurge(feeType, id) {
 
 /* يحذف العنصر نهائياً.
    - المنتج: يُحذف مباشرة (رسومه غير قابلة للاسترجاع).
-   - المحل: يُحذف فقط بعد استرجاع رسوم فتحه بالكامل، ويُحذف معه كل منتجاته بدون أي استرجاع لرسومها. */
-async function finalizeRemoval(type, id, ref, data) {
+   - المحل: يُحذف بعد استرجاع رسوم فتحه (إن كان قيد المراجعة)، أو مباشرة بلا استرجاع (إن كان منشوراً)، ويُحذف معه كل منتجاته. */
+async function finalizeRemoval(type, id, ref, data, force = false) {
   if (type === "shop") {
-    if (!(await canPurge("shop_fee", id))) return false;
+    // force = حذف بلا استرجاع (محل منشور): لا ننتظر استرجاع الرسوم
+    if (!force && !(await canPurge("shop_fee", id))) return false;
     const pq = await db.collection("products").where("shopId", "==", String(id)).get();
     for (const pd of pq.docs) await purgeDoc(pd.ref, pd.data());
   }
@@ -686,7 +687,7 @@ async function refundShopFees(shopId, reason, by) {
    - approve: قبول محل قيد المراجعة ونشره.
    - reject : رفض محل قيد المراجعة + استرجاع رسوم فتحه (ناقص خصم الشبكة). إذا نجح الاسترجاع يصبح المحل refunded مع سبب الرفض
               ويستطيع المالك تعديل بياناته والدفع من جديد. إذا فشل الاسترجاع يبقى المحل قيد المراجعة لإعادة المحاولة.
-   - remove : حذف المحل يسترجع رسوم فتح المحل فقط ثم يمحى نهائياً مع منتجاته. حذف المنتج: بدون أي استرجاع. */
+   - remove : حذف محل منشور يمحوه نهائياً مع منتجاته بدون أي استرجاع. حذف محل قيد المراجعة (pending) يسترجع رسومه أولاً. حذف المنتج: بدون أي استرجاع. */
 app.post("/api/admin/moderate", wrap(async (req, res) => {
   const u = await adminOnly(req, res); if (!u) return;
   const { type, id, action, message } = req.body;
@@ -735,12 +736,14 @@ app.post("/api/admin/moderate", wrap(async (req, res) => {
   bustShops(); // يختفي من الواجهة العامة فوراً
 
   let refunded = 0, failed = 0, total = 0, lastErr = "";
-  if (type === "shop") {
-    // استرجاع رسوم فتح المحل فقط
+  /* الاسترجاع فقط لمحل لم تتم الموافقة عليه بعد (pending).
+     المحل الذي نُشر مرة (live) تُحذف بياناته دون استرجاع رسوم فتحه. */
+  const refundable = type === "shop" && s.data().status === "pending";
+  if (refundable) {
     const r = await refundShopFees(id, msg, u.username);
     refunded = r.refunded; failed = r.failed; total = r.amount; lastErr = r.error;
   }
-  const deleted = await finalizeRemoval(type, String(id), ref, s.data());
+  const deleted = await finalizeRemoval(type, String(id), ref, s.data(), type === "shop" && !refundable);
   if (!deleted && refunded) await ref.update({ feePaid: false });
   bustShops();
   res.json({ success: true, refunded, failed, amount: Number(total.toFixed(7)), error: lastErr, deleted });
