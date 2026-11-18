@@ -81,6 +81,7 @@ setInterval(() => { const n = Date.now(); for (const [k, v] of rl) if (n - v.s >
 
 const clean = (v, max) => String(v ?? "").replace(/[\u0000-\u001F]/g, " ").trim().slice(0, max);
 const isImg = u => typeof u === "string" && u.startsWith("https://res.cloudinary.com/");
+const isMapUrl = u => { try { const x = new URL(u); return x.protocol === "https:" && /^(([a-z0-9-]+\.)*google\.(com|[a-z]{2}|com\.[a-z]{2}|co\.[a-z]{2})|maps\.app\.goo\.gl|goo\.gl)$/i.test(x.hostname); } catch { return false; } };
 const wrap = fn => async (req, res) => {
   try { await fn(req, res); }
   catch (e) {
@@ -116,7 +117,7 @@ async function adminOnly(req, res) {
   return u;
 }
 
-const pubShop = (id, d) => ({ id, name: d.name, country: d.country, region: d.region, address: d.address, phone: d.phone, hours: d.hours || "", description: d.description || "", image: d.image || "" });
+const pubShop = (id, d) => ({ id, name: d.name, country: d.country, region: d.region, address: d.address, phone: d.phone, hours: d.hours || "", description: d.description || "", image: d.image || "", mapUrl: d.mapUrl || "" });
 const pubProd = (id, d) => ({ id, name: d.name, brand: d.brand || "", size: d.size || "", price: d.price, currency: d.currency || "", description: d.description || "", image: d.image || "", createdAt: d.createdAt || 0 });
 
 /* كاش قصير لقائمة المحلات العامة (يُمسح عند أي تغيير) لتقليل قراءات Firestore */
@@ -218,10 +219,12 @@ app.post("/api/shop/save", wrap(async (req, res) => {
   const data = {
     name: clean(b.name, 80), country: clean(b.country, 2).toUpperCase(), region: clean(b.region, 60),
     address: clean(b.address, 160), phone: clean(b.phone, 30), hours: clean(b.hours, 60),
-    description: clean(b.description, 500), image: isImg(b.image) ? b.image : ""
+       description: clean(b.description, 500), image: isImg(b.image) ? b.image : "",
+    mapUrl: clean(b.mapUrl, 500)
   };
   if (!data.name || !/^[A-Z]{2}$/.test(data.country) || !data.region || !data.address || !data.phone || !data.image)
     return res.status(400).json({ error: "Please complete all required fields (including the shop photo)" });
+    if (data.mapUrl && !isMapUrl(data.mapUrl)) return res.status(400).json({ error: "Invalid Google Maps link" });
   const ref = db.collection("shops").doc(u.uid);
   const snap = await ref.get();
   if (snap.exists) {
