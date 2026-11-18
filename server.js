@@ -67,6 +67,8 @@ function friendlyRefundError(msg) {
   return "فشل الاسترجاع: " + msg.slice(0, 300);
 }
 
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
 const rl = new Map();
 function limited(key, max, ms) {
   const now = Date.now();
@@ -86,6 +88,15 @@ const wrap = fn => async (req, res) => {
     if (!res.headersSent) res.status(500).json({ error: errInfo(e).slice(0, 400) });
   }
 };
+
+/* حدّ الطلبات حسب IP لمسارات الدفع (لا تحمل توكن المستخدم) */
+function ipLimited(req, res, name, max, ms) {
+  if (limited(name + "_" + (req.ip || "x"), max, ms)) {
+    res.status(429).json({ error: "Too many requests" });
+    return true;
+  }
+  return false;
+}
 
 async function auth(req, res) {
   const { accessToken, userUid } = req.body || {};
@@ -108,8 +119,14 @@ async function adminOnly(req, res) {
 const pubShop = (id, d) => ({ id, name: d.name, country: d.country, region: d.region, address: d.address, phone: d.phone, hours: d.hours || "", description: d.description || "", image: d.image || "" });
 const pubProd = (id, d) => ({ id, name: d.name, brand: d.brand || "", size: d.size || "", price: d.price, currency: d.currency || "", description: d.description || "", image: d.image || "", createdAt: d.createdAt || 0 });
 
+/* كاش قصير لقائمة المحلات العامة (يُمسح عند أي تغيير) لتقليل قراءات Firestore */
+const SHOPS_TTL = 30000;
+let shopsCache = { t: 0, d: null };
+const bustShops = () => { shopsCache = { t: 0, d: null }; };
+
 const app = express();
 app.disable("x-powered-by");
+app.set("trust proxy", 1); // Render يعمل خلف proxy، لنحصل على IP الحقيقي
 
 /* ===== رؤوس أمان أساسية ===== */
 app.use((req, res, next) => {
@@ -148,6 +165,7 @@ app.get("/api/config", (_, res) => {
 
 /* المحلات المنشورة مع منتجاتها المنشورة (المحلات قيد المراجعة لا تظهر) */
 app.get("/api/shops", wrap(async (_, res) => {
+  if (shopsCache.d && Date.now() - shopsCache.t < SHOPS_TTL) return res.json(shopsCache.d);
   const [s, p] = await Promise.all([
     db.collection("shops").where("status", "==", "live").get(),
     db.collection("products").where("status", "==", "live").get()
@@ -158,7 +176,9 @@ app.get("/api/shops", wrap(async (_, res) => {
     const list = (prods[d.id] || []).sort((a, b) => b.createdAt - a.createdAt);
     return { ...pubShop(d.id, d.data()), products: list };
   });
-  res.json({ shops });
+  const out = { shops };
+  shopsCache = { t: Date.now(), d: out };
+  res.json(out);
 }));
 
 /* ===== حساب المستخدم ===== */
@@ -210,12 +230,15 @@ app.post("/api/shop/save", wrap(async (req, res) => {
     const upd = { ...data, ownerUsername: u.username, updatedAt: Date.now() };
     if (old.status === "refunded") { upd.status = "unpaid"; upd.reviewMessage = ""; }
     await ref.update(upd);
+    // حذف الصورة القديمة من Cloudinary إذا تغيّرت (لمنع تراكم صور يتيمة)
+    if (old.image && old.image !== data.image) await destroyImage(old.image, u.uid);
   } else {
     await ref.set({
       ...data, ownerUid: u.uid, ownerUsername: u.username, status: "unpaid",
       feePaid: false, reviewMessage: "", createdAt: Date.now()
     });
   }
+  bustShops();
   res.json({ success: true, id: u.uid });
 }));
 
@@ -243,6 +266,8 @@ app.post("/api/product/save", wrap(async (req, res) => {
     const upd = { ...data, updatedAt: Date.now() };
     if (old.status === "refunded") { upd.status = "unpaid"; upd.reviewMessage = ""; }
     await ref.update(upd);
+    if (old.image && old.image !== data.image) await destroyImage(old.image, u.uid);
+    bustShops();
     return res.json({ success: true, id: ref.id });
   }
   const count = (await db.collection("products").where("ownerUid", "==", u.uid).get()).size;
@@ -259,7 +284,9 @@ app.post("/api/product/delete", wrap(async (req, res) => {
   const ref = db.collection("products").doc(String(req.body.id || ""));
   const s = await ref.get();
   if (!s.exists || s.data().ownerUid !== u.uid) return res.status(403).json({ error: "Not your product" });
+  await destroyImage(s.data().image, u.uid);
   await ref.delete();
+  bustShops();
   res.json({ success: true });
 }));
 
@@ -284,6 +311,7 @@ async function checkPayment(p) {
 }
 
 app.post("/api/pay/approve", wrap(async (req, res) => {
+  if (ipLimited(req, res, "pay_ap", 60, 60000)) return;
   const { paymentId } = req.body || {};
   if (!paymentId) return res.status(400).json({ error: "Missing data" });
   const pid = String(paymentId);
@@ -296,10 +324,12 @@ app.post("/api/pay/approve", wrap(async (req, res) => {
 }));
 
 app.post("/api/pay/complete", wrap(async (req, res) => {
+  if (ipLimited(req, res, "pay_cp", 60, 60000)) return;
   const { paymentId, txid } = req.body || {};
   if (!paymentId) return res.status(400).json({ error: "Missing data" });
   const pid = String(paymentId);
-  const done = await db.collection("payments").doc(pid).get();
+  const pref = db.collection("payments").doc(pid);
+  const done = await pref.get();
   if (done.exists) return res.json({ success: true });
   const p = await getPayment(pid);
   const c = await checkPayment(p);
@@ -310,25 +340,36 @@ app.post("/api/pay/complete", wrap(async (req, res) => {
       method: "POST", headers: { Authorization: `Key ${PI_KEY}`, "Content-Type": "application/json" },
       body: JSON.stringify({ txid: tx })
     });
-    if (!r.ok) throw new Error(await r.text());
+    if (!r.ok) {
+      const txt = await r.text();
+      // طلب متزامن آخر قد يكون أكمل الدفعة للتو: نتحقق قبل اعتباره فشلاً
+      const again = await getPayment(pid).catch(() => null);
+      if (!(again && again.status && again.status.developer_completed)) throw new Error(txt);
+    }
   }
-  // إذا كان العنصر مدفوعاً مسبقاً (دفعة مكررة) نسجّلها فقط
-  const fresh = c.d.status === "unpaid";
-  const b = db.batch();
-  if (fresh) {
-    // المحل بعد الدفع يذهب إلى المراجعة (pending) ولا يُنشر مباشرة. أما المنتج فيُنشر مباشرة.
-    b.update(c.ref, c.type === "shop_fee"
-      ? { status: "pending", feePaid: true, reviewMessage: "", submittedAt: Date.now() }
-      : { status: "live", feePaid: true, publishedAt: Date.now() });
-  }
-  b.set(db.collection("payments").doc(pid), {
-    userUid: p.user_uid, type: c.type, targetId: c.targetId, targetName: c.d.name,
-    amount: c.fee, txid: tx, paidAt: Date.now(),
-    // رسوم المنتجات غير قابلة للاسترجاع أبداً، أما رسوم المحل فتبدأ بـ none
-    refundStatus: c.type === "product_fee" ? "nonrefundable" : "none",
-    duplicate: !fresh
+  /* تسجيل الدفعة وتحديث العنصر داخل transaction واحدة:
+     يمنع التسجيل المزدوج عند وصول طلبين متزامنين لنفس paymentId */
+  await db.runTransaction(async t => {
+    const ps = await t.get(pref);
+    if (ps.exists) return; // سُجّلت من طلب آخر
+    const ts = await t.get(c.ref);
+    // إذا كان العنصر مدفوعاً مسبقاً (دفعة مكررة) نسجّلها فقط
+    const fresh = ts.exists && ts.data().status === "unpaid";
+    if (fresh) {
+      // المحل بعد الدفع يذهب إلى المراجعة (pending) ولا يُنشر مباشرة. أما المنتج فيُنشر مباشرة.
+      t.update(c.ref, c.type === "shop_fee"
+        ? { status: "pending", feePaid: true, reviewMessage: "", submittedAt: Date.now() }
+        : { status: "live", feePaid: true, publishedAt: Date.now() });
+    }
+    t.set(pref, {
+      userUid: p.user_uid, type: c.type, targetId: c.targetId, targetName: c.d.name,
+      amount: c.fee, txid: tx, paidAt: Date.now(),
+      // رسوم المنتجات غير قابلة للاسترجاع أبداً، أما رسوم المحل فتبدأ بـ none
+      refundStatus: c.type === "product_fee" ? "nonrefundable" : "none",
+      duplicate: !fresh
+    });
   });
-  await b.commit();
+  bustShops();
   res.json({ success: true });
 }));
 
@@ -540,7 +581,13 @@ async function refundPayment(paymentId, reason, by) {
       txid = await pi().submitPayment(rid);
       await pref.update({ refundTxid: txid });
     }
-    await pi().completePayment(rid, txid);
+    try {
+      await pi().completePayment(rid, txid);
+    } catch (ce) {
+      // إذا كانت الدفعة مكتملة أصلاً على Pi (إعادة محاولة بعد حالة stuck) نعتبرها ناجحة
+      const m = errInfo(ce).toLowerCase();
+      if (!(m.includes("already") && m.includes("complet"))) throw ce;
+    }
   } catch (e) {
     const raw = errInfo(e);
     console.error("REFUND ERROR:", paymentId, raw);
@@ -553,13 +600,21 @@ async function refundPayment(paymentId, reason, by) {
     }
     throw new Error(friendlyRefundError(raw));
   }
-  try {
-    await pref.update({
-      refundStatus: "refunded", refundTxid: txid, refundedAt: Date.now(),
-      refundAmount: refundAmt, refundDeduction: deduct,
-      refundReason: clean(reason, 200), refundedBy: by
-    });
-  } catch (e) { console.error("Refund sent but DB update failed:", paymentId, txid, errInfo(e)); }
+  // المال أُرسل فعلاً: نحاول حفظ الحالة النهائية عدة مرات
+  const finalData = {
+    refundStatus: "refunded", refundTxid: txid, refundedAt: Date.now(),
+    refundAmount: refundAmt, refundDeduction: deduct,
+    refundReason: clean(reason, 200), refundedBy: by
+  };
+  let saved = false;
+  for (let i = 0; i < 3 && !saved; i++) {
+    try { await pref.update(finalData); saved = true; }
+    catch (e) { console.error("Refund sent but DB update failed (try " + (i + 1) + "):", paymentId, txid, errInfo(e)); await sleep(400 * (i + 1)); }
+  }
+  if (!saved) {
+    // لا نترك الحالة processing للأبد: نضع stuck مع rid/txid ليتمكن الأدمن من إعادة المحاولة (ستُكمل نفس الدفعة دون إرسال جديد)
+    await pref.update({ refundStatus: "stuck", refundRid: rid, refundTxid: txid, lastError: "Refund sent but final DB update failed" }).catch(() => {});
+  }
   return { txid, amount: refundAmt };
 }
 
@@ -611,17 +666,20 @@ async function finalizeRemoval(type, id, ref, data) {
   return true;
 }
 
-/* يسترجع كل دفعات رسوم فتح المحل القابلة للاسترجاع. يرجع ملخصاً بالنتيجة */
+/* يسترجع كل دفعات رسوم فتح المحل القابلة للاسترجاع. يرجع ملخصاً بالنتيجة
+   processing = عدد الدفعات التي يجري استرجاعها حالياً (لتفادي اعتبار الرفض ناجحاً دون استرجاع) */
 async function refundShopFees(shopId, reason, by) {
-  let refunded = 0, failed = 0, total = 0, lastErr = "";
+  let refunded = 0, failed = 0, total = 0, processing = 0, lastErr = "";
   const ps = await db.collection("payments").where("targetId", "==", String(shopId)).get();
   for (const d of ps.docs) {
     const x = d.data();
-    if (x.type !== "shop_fee" || !["none", "failed", "stuck"].includes(x.refundStatus)) continue;
+    if (x.type !== "shop_fee") continue;
+    if (x.refundStatus === "processing") { processing++; continue; }
+    if (!["none", "failed", "stuck"].includes(x.refundStatus)) continue;
     try { const r = await refundPayment(d.id, reason, by); refunded++; total += r.amount; }
     catch (e) { failed++; lastErr = e.message; console.error("Refund failed:", d.id, e.message); }
   }
-  return { refunded, failed, amount: Number(total.toFixed(7)), error: lastErr };
+  return { refunded, failed, processing, amount: Number(total.toFixed(7)), error: lastErr };
 }
 
 /* مراجعة وحذف محل/منتج أو استعادته.
@@ -642,6 +700,7 @@ app.post("/api/admin/moderate", wrap(async (req, res) => {
     const d = s.data();
     if (d.status !== "removed") return res.status(400).json({ error: "Not removed" });
     await ref.update({ status: d.feePaid ? "live" : "unpaid", reviewMessage: "", reviewedAt: Date.now() });
+    bustShops();
     return res.json({ success: true });
   }
 
@@ -651,6 +710,7 @@ app.post("/api/admin/moderate", wrap(async (req, res) => {
     if (d.status !== "pending") return res.status(400).json({ error: "Shop is not awaiting review" });
     if (action === "approve") {
       await ref.update({ status: "live", reviewMessage: "", reviewedAt: Date.now(), publishedAt: Date.now() });
+      bustShops();
       return res.json({ success: true });
     }
     const why = clean(message, 300);
@@ -660,13 +720,19 @@ app.post("/api/admin/moderate", wrap(async (req, res) => {
       // فشل الاسترجاع: يبقى المحل قيد المراجعة ليعيد الأدمن المحاولة
       return res.json({ success: true, rejected: false, refunded: r.refunded, failed: r.failed, amount: r.amount, error: r.error });
     }
+    if (r.processing && !r.refunded) {
+      // استرجاع جارٍ لهذه الدفعة: لا نعتبر المحل مرفوضاً قبل اكتماله
+      return res.status(409).json({ error: "A refund for this shop is still processing. Try again in a moment." });
+    }
     await ref.update({ status: "refunded", feePaid: false, reviewMessage: why, reviewedAt: Date.now() });
+    bustShops();
     return res.json({ success: true, rejected: true, refunded: r.refunded, failed: 0, amount: r.amount, error: "" });
   }
 
   const msg = clean(message, 300);
   if (!msg) return res.status(400).json({ error: "Reason required" });
   await ref.update({ status: "removed", reviewMessage: msg, reviewedAt: Date.now() });
+  bustShops(); // يختفي من الواجهة العامة فوراً
 
   let refunded = 0, failed = 0, total = 0, lastErr = "";
   if (type === "shop") {
@@ -676,6 +742,7 @@ app.post("/api/admin/moderate", wrap(async (req, res) => {
   }
   const deleted = await finalizeRemoval(type, String(id), ref, s.data());
   if (!deleted && refunded) await ref.update({ feePaid: false });
+  bustShops();
   res.json({ success: true, refunded, failed, amount: Number(total.toFixed(7)), error: lastErr, deleted });
 }));
 
@@ -694,6 +761,7 @@ app.post("/api/admin/refund", wrap(async (req, res) => {
   const r = await refundPayment(paymentId, reason || tg.data().reviewMessage, u.username);
   const deleted = await finalizeRemoval("shop", String(x.targetId), tg.ref, tg.data());
   if (!deleted) await tg.ref.update({ feePaid: false });
+  bustShops();
   res.json({ success: true, txid: r.txid, amount: r.amount, deleted });
 }));
 
