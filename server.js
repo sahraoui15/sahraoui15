@@ -201,7 +201,7 @@ app.post("/api/me", wrap(async (req, res) => {
 
 app.post("/api/upload", wrap(async (req, res) => {
   const u = await auth(req, res); if (!u) return;
-  if (limited("up_" + u.uid, 30, 3600000)) return res.status(429).json({ error: "Too many uploads" });
+  if (limited("up_" + u.uid, 60, 3600000)) return res.status(429).json({ error: "Too many uploads" });
   const f = req.body.file || "";
   const m = f.match(/^data:image\/(jpeg|png|webp);base64,(.+)$/);
   if (!m) return res.status(400).json({ error: "Invalid image" });
