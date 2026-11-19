@@ -81,6 +81,8 @@ setInterval(() => { const n = Date.now(); for (const [k, v] of rl) if (n - v.s >
 
 const clean = (v, max) => String(v ?? "").replace(/[\u0000-\u001F]/g, " ").trim().slice(0, max);
 const isImg = u => typeof u === "string" && u.startsWith("https://res.cloudinary.com/");
+const cleanImgs = (arr, one) => { const a = (Array.isArray(arr) ? arr : []).filter(isImg); if (!a.length && isImg(one)) a.push(one); return [...new Set(a)].slice(0, 3); };
+const imgsOf = d => (d && d.images && d.images.length ? d.images : (d && d.image ? [d.image] : []));
 const isMapUrl = u => { try { const x = new URL(u); return x.protocol === "https:" && /^(([a-z0-9-]+\.)*google\.(com|[a-z]{2}|com\.[a-z]{2}|co\.[a-z]{2})|maps\.app\.goo\.gl|goo\.gl)$/i.test(x.hostname); } catch { return false; } };
 const wrap = fn => async (req, res) => {
   try { await fn(req, res); }
@@ -117,9 +119,8 @@ async function adminOnly(req, res) {
   return u;
 }
 
-const pubShop = (id, d) => ({ id, name: d.name, country: d.country, region: d.region, address: d.address, phone: d.phone, hours: d.hours || "", description: d.description || "", image: d.image || "", mapUrl: d.mapUrl || "" });
-const pubProd = (id, d) => ({ id, name: d.name, brand: d.brand || "", size: d.size || "", price: d.price, currency: d.currency || "", description: d.description || "", image: d.image || "", createdAt: d.createdAt || 0 });
-
+const pubShop = (id, d) => ({ id, name: d.name, country: d.country, region: d.region, address: d.address, phone: d.phone, hours: d.hours || "", description: d.description || "", image: d.image || "", images: imgsOf(d), mapUrl: d.mapUrl || "" });
+const pubProd = (id, d) => ({ id, name: d.name, brand: d.brand || "", size: d.size || "", price: d.price, currency: d.currency || "", description: d.description || "", image: d.image || "", images: imgsOf(d), createdAt: d.createdAt || 0 });
 /* كاش قصير لقائمة المحلات العامة (يُمسح عند أي تغيير) لتقليل قراءات Firestore */
 const SHOPS_TTL = 30000;
 let shopsCache = { t: 0, d: null };
@@ -219,7 +220,7 @@ app.post("/api/shop/save", wrap(async (req, res) => {
   const data = {
     name: clean(b.name, 80), country: clean(b.country, 2).toUpperCase(), region: clean(b.region, 60),
     address: clean(b.address, 160), phone: clean(b.phone, 30), hours: clean(b.hours, 60),
-       description: clean(b.description, 500), image: isImg(b.image) ? b.image : "",
+       description: clean(b.description, 500), images: cleanImgs(b.images, b.image), image: cleanImgs(b.images, b.image)[0] || "",
     mapUrl: clean(b.mapUrl, 500)
   };
   if (!data.name || !/^[A-Z]{2}$/.test(data.country) || !data.region || !data.address || !data.phone || !data.image)
@@ -234,7 +235,7 @@ app.post("/api/shop/save", wrap(async (req, res) => {
     if (old.status === "refunded") { upd.status = "unpaid"; upd.reviewMessage = ""; }
     await ref.update(upd);
     // حذف الصورة القديمة من Cloudinary إذا تغيّرت (لمنع تراكم صور يتيمة)
-    if (old.image && old.image !== data.image) await destroyImage(old.image, u.uid);
+   for (const o of imgsOf(old)) if (!data.images.includes(o)) await destroyImage(o, u.uid);
   } else {
     await ref.set({
       ...data, ownerUid: u.uid, ownerUsername: u.username, status: "unpaid",
@@ -256,7 +257,7 @@ app.post("/api/product/save", wrap(async (req, res) => {
   const data = {
     name: clean(b.name, 80), brand: clean(b.brand, 60), size: clean(b.size, 30),
     price, currency: ({ PI: "Pi", OUSD: "OUSD" })[clean(b.currency, 6).toUpperCase()] || "", description: clean(b.description, 400),
-    image: isImg(b.image) ? b.image : ""
+    images: cleanImgs(b.images, b.image), image: cleanImgs(b.images, b.image)[0] || ""
   };
   if (!data.name || !(price > 0 && price < 1e9) || !data.currency || !data.image)
     return res.status(400).json({ error: "Please complete all required fields (including the product photo)" });
@@ -269,7 +270,7 @@ app.post("/api/product/save", wrap(async (req, res) => {
     const upd = { ...data, updatedAt: Date.now() };
     if (old.status === "refunded") { upd.status = "unpaid"; upd.reviewMessage = ""; }
     await ref.update(upd);
-    if (old.image && old.image !== data.image) await destroyImage(old.image, u.uid);
+    for (const o of imgsOf(old)) if (!data.images.includes(o)) await destroyImage(o, u.uid);
     bustShops();
     return res.json({ success: true, id: ref.id });
   }
@@ -287,7 +288,7 @@ app.post("/api/product/delete", wrap(async (req, res) => {
   const ref = db.collection("products").doc(String(req.body.id || ""));
   const s = await ref.get();
   if (!s.exists || s.data().ownerUid !== u.uid) return res.status(403).json({ error: "Not your product" });
-  await destroyImage(s.data().image, u.uid);
+  for (const o of imgsOf(s.data())) await destroyImage(o, u.uid);
   await ref.delete();
   bustShops();
   res.json({ success: true });
@@ -646,7 +647,7 @@ async function destroyImage(url, ownerUid) {
   catch (e) { console.error("cloudinary destroy:", id, errInfo(e)); }
 }
 async function purgeDoc(ref, data) {
-  await destroyImage(data && data.image, data && data.ownerUid);
+  for (const o of imgsOf(data)) await destroyImage(o, data && data.ownerUid);
   await ref.delete();
 }
 
