@@ -13,7 +13,7 @@ const env = process.env;
 const SHOP_FEE = Number(env.SHOP_FEE || 5);          // رسوم فتح المحل
 const PRODUCT_FEE = Number(env.PRODUCT_FEE || 0.25); // رسوم إضافة منتج (غير قابلة للاسترجاع أبداً)
 const REFUND_DEDUCT = Number(env.REFUND_DEDUCT ?? 0.01); // خصم رسوم الشبكة من استرجاع رسوم فتح المحل
-const FREE_SHOPS = Number(env.FREE_SHOPS ?? 5);          // عدد المحلات المجانية الأولى
+const FREE_SHOPS = Number(env.FREE_SHOPS ?? 0);          // عدد المحلات المجانية الأولى
 const FREE_PRODUCTS = Number(env.FREE_PRODUCTS ?? 1);     // عدد العطور المجانية لكل محل مجاني
 const FREE_PRODUCT_ALL = env.FREE_PRODUCT_ALL === "true"; // true = العطر المجاني لكل المحلات
 const ADMINS = (env.ADMIN_USERNAMES || "").split(",").map(s => s.trim().replace(/^@/, "").toLowerCase()).filter(Boolean);
