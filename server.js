@@ -13,7 +13,7 @@ const env = process.env;
 const SHOP_FEE = Number(env.SHOP_FEE || 5);          // رسوم فتح المحل
 const PRODUCT_FEE = Number(env.PRODUCT_FEE || 0.25); // رسوم إضافة منتج (غير قابلة للاسترجاع أبداً)
 const REFUND_DEDUCT = Number(env.REFUND_DEDUCT ?? 0.01); // خصم رسوم الشبكة من استرجاع رسوم فتح المحل
-const FREE_SHOPS = Number(env.FREE_SHOPS ?? 0);          // عدد المحلات المجانية الأولى
+const FREE_SHOPS = Number(env.FREE_SHOPS ?? 5);          // عدد المحلات المجانية الأولى
 const FREE_PRODUCTS = Number(env.FREE_PRODUCTS ?? 1);     // عدد العطور المجانية لكل محل مجاني
 const FREE_PRODUCT_ALL = env.FREE_PRODUCT_ALL === "true"; // true = العطر المجاني لكل المحلات
 const ADMINS = (env.ADMIN_USERNAMES || "").split(",").map(s => s.trim().replace(/^@/, "").toLowerCase()).filter(Boolean);
@@ -124,7 +124,7 @@ async function adminOnly(req, res) {
 }
 
 const pubShop = (id, d) => ({ id, name: d.name, country: d.country, region: d.region, address: d.address, phone: d.phone, hours: d.hours || "", description: d.description || "", image: d.image || "", images: imgsOf(d), rAvg: ratingAvg(d), rCount: Number(d.ratingCount) || 0, mapUrl: d.mapUrl || "" });
-const pubProd = (id, d) => ({ id, name: d.name, brand: d.brand || "", size: d.size || "", price: d.price, currency: d.currency || "", description: d.description || "", image: d.image || "", images: imgsOf(d), rAvg: ratingAvg(d), rCount: Number(d.ratingCount) || 0, createdAt: d.createdAt || 0 });
+const pubProd = (id, d) => ({ id, name: d.name, brand: d.brand || "", size: d.size || "", gender: d.gender || "unisex", price: d.price, currency: d.currency || "", description: d.description || "", image: d.image || "", images: imgsOf(d), rAvg: ratingAvg(d), rCount: Number(d.ratingCount) || 0, createdAt: d.createdAt || 0 });
 /* كاش قصير لقائمة المحلات العامة (يُمسح عند أي تغيير) لتقليل قراءات Firestore */
 const SHOPS_TTL = 30000;
 let shopsCache = { t: 0, d: null };
@@ -264,7 +264,8 @@ app.post("/api/product/save", wrap(async (req, res) => {
   const data = {
     name: clean(b.name, 80), brand: clean(b.brand, 60), size: clean(b.size, 30),
     price, currency: ({ PI: "Pi", OUSD: "OUSD" })[clean(b.currency, 6).toUpperCase()] || "", description: clean(b.description, 400),
-    images: cleanImgs(b.images, b.image), image: cleanImgs(b.images, b.image)[0] || ""
+        images: cleanImgs(b.images, b.image), image: cleanImgs(b.images, b.image)[0] || "",
+    gender: ["men", "women", "unisex"].includes(String(b.gender)) ? String(b.gender) : "unisex"
   };
   if (!data.name || !(price > 0 && price < 1e9) || !data.currency || !data.image)
     return res.status(400).json({ error: "Please complete all required fields (including the product photo)" });
